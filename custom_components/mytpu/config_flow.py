@@ -26,6 +26,7 @@ from .const import (
     CONF_WATER_SERVICE,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
+    MIN_UPDATE_INTERVAL_HOURS,
 )
 from .models import Service, ServiceType
 
@@ -288,7 +289,7 @@ class TPUOptionsFlow(OptionsFlow):
                     default=self._config_entry.options.get(
                         CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
                     ),
-                ): int,
+                ): vol.All(vol.Coerce(int), vol.Range(min=MIN_UPDATE_INTERVAL_HOURS)),
             }
         )
 

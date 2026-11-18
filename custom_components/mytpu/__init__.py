@@ -42,6 +42,7 @@ from .const import (
     CONF_WATER_SERVICE,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
+    MIN_UPDATE_INTERVAL_HOURS,
 )
 from .models import Service, ServiceType
 
@@ -115,8 +116,12 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         config_entry: ConfigEntry,
     ) -> None:
         """Initialize the coordinator."""
-        update_interval_hours = config_entry.options.get(
-            CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
+        # Clamp in case an invalid value was saved before validation existed
+        update_interval_hours = max(
+            config_entry.options.get(
+                CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
+            ),
+            MIN_UPDATE_INTERVAL_HOURS,
         )
         super().__init__(
             hass,
