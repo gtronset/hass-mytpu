@@ -59,11 +59,33 @@ Historical data and cumulative totals are tracked using Home Assistant's [statis
 
 ## Energy Dashboard Setup
 
+Usage is imported as external statistics (`mytpu:p_<meter>_energy` and
+`mytpu:w_<meter>_water`), one row per day. TPU publishes readings once a day,
+a day or more behind, so recent days fill in later.
+
 1. Go to **Settings** → **Dashboards** → **Energy**
 2. Under "Electricity grid", click "Add consumption"
-3. Select the "Energy Consumption" sensor
+3. Select the "TPU Energy …" statistic
 4. Under "Water consumption", click "Add water source"
-5. Select the "Water Consumption" sensor
+5. Select the "TPU Water …" statistic
+
+### Costs
+
+Home Assistant can't apply a price entity or a static price to external
+statistics, so the integration can import cost statistics for you:
+
+1. Create an entity holding the current price, e.g. an `input_number` or a
+   template sensor, in your currency per kWh (power) or per CCF (water).
+2. Open the integration's **Configure** dialog and pick it as the power and/or
+   water price entity.
+3. On the next update the integration writes `mytpu:p_<meter>_energy_cost`
+   (and `mytpu:w_<meter>_water_cost`), backfilling all imported history.
+4. In the Energy settings, choose **Use an entity tracking the total costs** and
+   select the "TPU Energy cost …" (or "TPU Water cost …") statistic.
+
+Each day is priced once, at the price current when that day is first written.
+Changing the price later affects only days imported after the change; the
+backfill uses the price current at the time it runs.
 
 ## Acknowledgments
 

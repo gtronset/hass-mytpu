@@ -50,8 +50,11 @@
     "step": {
       "init": {
         "title": "Configure Options",
+        "description": "Optionally pick an entity holding the current price (USD/kWh for power, USD/CCF for water). When set, daily cost statistics are imported alongside usage for the Energy Dashboard's \"entity tracking the total costs\" option.",
         "data": {
-          "update_interval_hours": "Update Interval (hours)"
+          "update_interval_hours": "Update Interval (hours)",
+          "power_price_entity": "Power price entity (per kWh)",
+          "water_price_entity": "Water price entity (per CCF)"
         }
       }
     }
