@@ -12,6 +12,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigFlowResult
@@ -20,9 +21,11 @@ if TYPE_CHECKING:
 from .auth import AuthError, MyTPUAuth
 from .client import MyTPUClient
 from .const import (
+    CONF_POWER_PRICE_ENTITY,
     CONF_POWER_SERVICE,
     CONF_TOKEN_DATA,
     CONF_UPDATE_INTERVAL_HOURS,
+    CONF_WATER_PRICE_ENTITY,
     CONF_WATER_SERVICE,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
@@ -282,16 +285,39 @@ class TPUOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        options_schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_UPDATE_INTERVAL_HOURS,
-                    default=self._config_entry.options.get(
-                        CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
-                    ),
-                ): vol.All(vol.Coerce(int), vol.Range(min=MIN_UPDATE_INTERVAL_HOURS)),
-            }
+        options = self._config_entry.options
+        schema_dict: dict[Any, Any] = {
+            vol.Optional(
+                CONF_UPDATE_INTERVAL_HOURS,
+                default=options.get(
+                    CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
+                ),
+            ): vol.All(vol.Coerce(int), vol.Range(min=MIN_UPDATE_INTERVAL_HOURS)),
+        }
+
+        price_selector = EntitySelector(
+            EntitySelectorConfig(domain=["sensor", "input_number"])
         )
+        if self._config_entry.data.get(CONF_POWER_SERVICE):
+            schema_dict[
+                vol.Optional(
+                    CONF_POWER_PRICE_ENTITY,
+                    description={
+                        "suggested_value": options.get(CONF_POWER_PRICE_ENTITY)
+                    },
+                )
+            ] = price_selector
+        if self._config_entry.data.get(CONF_WATER_SERVICE):
+            schema_dict[
+                vol.Optional(
+                    CONF_WATER_PRICE_ENTITY,
+                    description={
+                        "suggested_value": options.get(CONF_WATER_PRICE_ENTITY)
+                    },
+                )
+            ] = price_selector
+
+        options_schema = vol.Schema(schema_dict)
 
         return self.async_show_form(step_id="init", data_schema=options_schema)
 

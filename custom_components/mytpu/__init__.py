@@ -36,9 +36,11 @@ from homeassistant.util import dt as dt_util
 from .auth import AuthError, MyTPUAuth, ServerError
 from .client import MyTPUClient, MyTPUError
 from .const import (
+    CONF_POWER_PRICE_ENTITY,
     CONF_POWER_SERVICE,
     CONF_TOKEN_DATA,
     CONF_UPDATE_INTERVAL_HOURS,
+    CONF_WATER_PRICE_ENTITY,
     CONF_WATER_SERVICE,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
@@ -207,8 +209,9 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 power_readings = await self.client.get_usage(
                     self.power_service, from_date=power_from_date
                 )
+                new_power_stats: list[StatisticData] = []
                 if power_readings:
-                    await self._import_statistics(
+                    new_power_stats = await self._import_statistics(
                         self.power_service,
                         power_readings,
                         "energy",
@@ -222,6 +225,14 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "date": latest.date,
                         "unit": latest.unit,
                     }
+
+                await self._import_cost_statistics(
+                    self.power_service,
+                    "energy",
+                    power_statistic_id,
+                    new_power_stats,
+                    self.config_entry.options.get(CONF_POWER_PRICE_ENTITY),
+                )
 
             # Fetch and import water usage statistics
             if self.water_service:
@@ -261,8 +272,9 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 water_readings = await self.client.get_usage(
                     self.water_service, from_date=water_from_date
                 )
+                new_water_stats: list[StatisticData] = []
                 if water_readings:
-                    await self._import_statistics(
+                    new_water_stats = await self._import_statistics(
                         self.water_service,
                         water_readings,
                         "water",
@@ -276,6 +288,14 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "date": latest.date,
                         "unit": latest.unit,
                     }
+
+                await self._import_cost_statistics(
+                    self.water_service,
+                    "water",
+                    water_statistic_id,
+                    new_water_stats,
+                    self.config_entry.options.get(CONF_WATER_PRICE_ENTITY),
+                )
 
             # Save token data again in case it was refreshed during usage fetching
             await self._save_token_data()
@@ -426,10 +446,13 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         *,
         cumulative_sum: float = 0.0,
         last_stat_time: float | None = None,
-    ) -> None:
-        """Import historical usage data as statistics."""
+    ) -> list[StatisticData]:
+        """Import historical usage data as statistics.
+
+        Returns the statistics rows that were written (empty if none).
+        """
         if not readings:
-            return
+            return []
 
         # Create statistic_id based on service
         # Sanitize to avoid validation errors: lowercase and replace hyphens
@@ -503,3 +526,117 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Import the statistics
         if statistics:
             async_add_external_statistics(self.hass, metadata, statistics)
+        return statistics
+
+    def _current_price(self, price_entity: str | None) -> float | None:
+        """Return the current numeric price from an entity, or None."""
+        if not price_entity:
+            return None
+        state = self.hass.states.get(price_entity)
+        if state is None:
+            _LOGGER.debug("Price entity %s not found", price_entity)
+            return None
+        try:
+            return float(state.state)
+        except (TypeError, ValueError):
+            _LOGGER.debug(
+                "Price entity %s has non-numeric state %s", price_entity, state.state
+            )
+            return None
+
+    async def _import_cost_statistics(
+        self,
+        service: Service,
+        stat_type: str,
+        consumption_statistic_id: str,
+        new_stats: list[StatisticData],
+        price_entity: str | None,
+    ) -> None:
+        """Import daily cost statistics priced at the entity's current value.
+
+        Cost rows are written for every consumption day after the last cost row,
+        so history is backfilled on first use and days missed while the price
+        was unavailable are caught up later. Each day is priced once, at the
+        price current when it is first written; later price changes do not
+        rewrite past days.
+        """
+        price = self._current_price(price_entity)
+        if price is None:
+            return
+
+        cost_statistic_id = f"{consumption_statistic_id}_cost"
+        last_cost_stats = await self.hass.async_add_executor_job(
+            get_last_statistics, self.hass, 1, cost_statistic_id, True, {"sum"}
+        )
+        last_cost_time: float | None = None
+        cost_sum = 0.0
+        if cost_statistic_id in last_cost_stats:
+            last_cost = last_cost_stats[cost_statistic_id][0]
+            last_cost_time = last_cost.get("start")
+            cost_sum = float(last_cost.get("sum") or 0.0)
+
+        query_start = (
+            datetime.fromtimestamp(last_cost_time, tz=UTC) + timedelta(seconds=1)
+            if last_cost_time is not None
+            else datetime(1970, 1, 1, tzinfo=UTC)
+        )
+        existing = await self.hass.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            query_start,
+            None,
+            {consumption_statistic_id},
+            "hour",
+            None,
+            {"state"},
+        )
+
+        # Merge recorder rows with rows queued in this update (the recorder
+        # may not have committed them yet), keyed by start timestamp.
+        days: dict[float, float] = {
+            float(row["start"]): float(row.get("state") or 0.0)
+            for row in existing.get(consumption_statistic_id, [])
+        }
+        for row in new_stats:
+            days[row["start"].timestamp()] = float(row.get("state") or 0.0)
+
+        pending = sorted(
+            (start, usage)
+            for start, usage in days.items()
+            if last_cost_time is None or start > last_cost_time
+        )
+        if not pending:
+            return
+
+        statistics: list[StatisticData] = []
+        if last_cost_time is None:
+            statistics.append(
+                StatisticData(
+                    start=datetime.fromtimestamp(pending[0][0], tz=UTC)
+                    - timedelta(days=1),
+                    state=0.0,
+                    sum=0.0,
+                )
+            )
+        for start, usage in pending:
+            cost = round(usage * price, 4)
+            cost_sum += cost
+            statistics.append(
+                StatisticData(
+                    start=datetime.fromtimestamp(start, tz=UTC),
+                    state=cost,
+                    sum=round(cost_sum, 4),
+                )
+            )
+
+        label = "Energy" if stat_type == "energy" else "Water"
+        metadata = StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=f"TPU {label} cost {service.display_meter_number}",
+            source=DOMAIN,
+            statistic_id=cost_statistic_id,
+            unit_class=None,
+            unit_of_measurement=self.hass.config.currency,
+        )
+        async_add_external_statistics(self.hass, metadata, statistics)

@@ -838,3 +838,38 @@ class TestTPUOptionsFlow:
         assert (
             mock_config_entry.options[CONF_UPDATE_INTERVAL_HOURS] == 5
         )  # Original entry options should not change yet
+
+
+class TestTPUOptionsFlowPrices:
+    """Price entity options."""
+
+    async def test_price_fields_follow_configured_meters(self, hass: HomeAssistant):
+        """Only meters that are configured get a price field."""
+        from custom_components.mytpu.const import (
+            CONF_POWER_PRICE_ENTITY,
+            CONF_WATER_PRICE_ENTITY,
+        )
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_USERNAME: "user", CONF_POWER_SERVICE: "{}"},
+            options={CONF_POWER_PRICE_ENTITY: "input_number.price"},
+        )
+        result = await TPUOptionsFlow(entry).async_step_init()
+        assert result["data_schema"] is not None
+        keys = {k.schema: k for k in result["data_schema"].schema}
+        assert CONF_POWER_PRICE_ENTITY in keys
+        assert CONF_WATER_PRICE_ENTITY not in keys
+        assert keys[CONF_POWER_PRICE_ENTITY].description == {
+            "suggested_value": "input_number.price"
+        }
+
+        entry_w = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_USERNAME: "user", CONF_WATER_SERVICE: "{}"},
+        )
+        result = await TPUOptionsFlow(entry_w).async_step_init()
+        assert result["data_schema"] is not None
+        keys = {k.schema for k in result["data_schema"].schema}
+        assert CONF_WATER_PRICE_ENTITY in keys
+        assert CONF_POWER_PRICE_ENTITY not in keys
