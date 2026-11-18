@@ -1,7 +1,7 @@
 """Tests for mytpu integration setup and coordinator."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,7 +20,11 @@ from custom_components.mytpu import (
 )
 from custom_components.mytpu.auth import AuthError, ServerError
 from custom_components.mytpu.client import MyTPUError
-from custom_components.mytpu.const import CONF_TOKEN_DATA, DOMAIN
+from custom_components.mytpu.const import (
+    CONF_TOKEN_DATA,
+    CONF_UPDATE_INTERVAL_HOURS,
+    DOMAIN,
+)
 from custom_components.mytpu.models import Service, ServiceType, UsageReading
 
 
@@ -143,6 +147,20 @@ class TestTPUDataUpdateCoordinator:
 
         assert coordinator.power_service is not None
         assert coordinator.water_service is None
+
+    @pytest.mark.parametrize(("saved", "expected"), [(0, 1), (-3, 1), (6, 6)])
+    def test_init_clamps_update_interval(
+        self, hass: HomeAssistant, make_config_entry, saved, expected
+    ):
+        """Test invalid saved update intervals are clamped to the minimum."""
+        config_entry = make_config_entry(include_power=True)
+        config_entry.add_to_hass(hass)
+        hass.config_entries.async_update_entry(
+            config_entry, options={CONF_UPDATE_INTERVAL_HOURS: saved}
+        )
+        coordinator = TPUDataUpdateCoordinator(hass, MagicMock(), config_entry)
+
+        assert coordinator.update_interval == timedelta(hours=expected)
 
     async def test_async_update_data_success(
         self,

@@ -811,6 +811,16 @@ class TestTPUOptionsFlow:
         assert optional_key is not None
         assert optional_key.default() == 5
 
+        # Intervals below the minimum are rejected
+        schema = result["data_schema"]
+        with pytest.raises(vol.Invalid):
+            schema({CONF_UPDATE_INTERVAL_HOURS: 0})
+        with pytest.raises(vol.Invalid):
+            schema({CONF_UPDATE_INTERVAL_HOURS: -1})
+        assert schema({CONF_UPDATE_INTERVAL_HOURS: 1}) == {
+            CONF_UPDATE_INTERVAL_HOURS: 1
+        }
+
     async def test_options_flow_update(self, hass: HomeAssistant):
         """Test updating options."""
         mock_config_entry = MockConfigEntry(

@@ -13,3 +13,4 @@ CONF_UPDATE_INTERVAL_HOURS = "update_interval_hours"
 
 # Default update interval in hours
 DEFAULT_UPDATE_INTERVAL_HOURS = 1
+MIN_UPDATE_INTERVAL_HOURS = 1
