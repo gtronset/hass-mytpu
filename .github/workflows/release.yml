@@ -13,7 +13,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 2
 
@@ -25,10 +25,12 @@ jobs:
 
       - name: Check if version changed
         id: changed
+        env:
+          NEW_VERSION: ${{ steps.version.outputs.version }}
         run: |
           git show HEAD~1:custom_components/mytpu/manifest.json > /tmp/old_manifest.json 2>/dev/null || echo '{"version":""}' > /tmp/old_manifest.json
           old_version=$(jq -r '.version' /tmp/old_manifest.json)
-          new_version=${{ steps.version.outputs.version }}
+          new_version="$NEW_VERSION"
           if [ "$old_version" != "$new_version" ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
@@ -39,8 +41,9 @@ jobs:
         if: steps.changed.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          version="${{ steps.version.outputs.version }}"
+          version="$VERSION"
           prerelease_flag=""
           if [[ "$version" == *"beta"* ]] || [[ "$version" == *"b"* ]] || [[ "$version" == *"alpha"* ]] || [[ "$version" == *"rc"* ]]; then
             prerelease_flag="--prerelease"
