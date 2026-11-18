@@ -87,6 +87,29 @@ Each day is priced once, at the price current when that day is first written.
 Changing the price later affects only days imported after the change; the
 backfill uses the price current at the time it runs.
 
+## Importing History
+
+The first setup imports the last 90 days. To bring in everything MyTPU still
+has (about two years of daily readings), run the **Tacoma Public Utilities:
+Import history** action (`mytpu.import_history`) from **Developer Tools** →
+**Actions**:
+
+```yaml
+action: mytpu.import_history
+data:
+  config_entry_id: <your TPU entry>
+  # start_date: "2025-01-01"  # optional; omit to import everything
+```
+
+The integration fetches history backward from today, a year at a time, until
+MyTPU returns no more readings. Only once every meter has been fetched does it
+replace the usage statistics. If a request fails, the existing statistics are
+left alone. Cost statistics are then cleared and rebuilt at the current price.
+
+The action returns the number of days and the date range imported for each
+meter. Taking a Home Assistant backup first is a good idea, since the existing
+usage statistics are replaced.
+
 ## Acknowledgments
 
 This project was inspired by and builds upon the work of [ex-nerd/mytpu](https://github.com/ex-nerd/mytpu).
