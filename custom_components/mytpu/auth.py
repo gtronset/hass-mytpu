@@ -96,7 +96,7 @@ class MyTPUAuth:
         self, username: str, password: str, session: aiohttp.ClientSession
     ) -> None:
         """Authenticate with username/password to get tokens."""
-        _LOGGER.debug("Starting full login for user: %s", username)
+        _LOGGER.debug("Starting full login")
         # First get the Basic auth token from the JS bundle
         basic_token = await self._get_oauth_basic_token(session)
 
@@ -114,13 +114,14 @@ class MyTPUAuth:
         async with session.post(url, data=data, headers=headers) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                _LOGGER.error("Login failed with status %s: %s", resp.status, text)
-                raise AuthError(f"Authentication failed: {resp.status} - {text}")
+                _LOGGER.error("Login failed with status %s", resp.status)
+                _LOGGER.debug("Login failure response: %.200s", text)
+                raise AuthError(f"Authentication failed: {resp.status}")
 
             result = await resp.json()
 
             if "access_token" not in result:
-                raise AuthError(f"No access token in response: {result}")
+                raise AuthError(f"No access token in response (keys: {sorted(result)})")
 
             expires_in = result.get("expires_in", 3600)
             user_info = result.get("user", {})
@@ -250,23 +251,24 @@ class MyTPUAuth:
             if resp.status != 200:
                 text = await resp.text()
                 _LOGGER.debug(
-                    "Token refresh failed with status %s: %s", resp.status, text
+                    "Token refresh failed with status %s: %.200s", resp.status, text
                 )
                 # Distinguish between client errors (auth issues) and server errors
                 if resp.status >= 500:
                     # Server error - temporary issue, should retry later
                     raise ServerError(
-                        f"MyTPU server error during token refresh: {resp.status} - {text}"
+                        f"MyTPU server error during token refresh: {resp.status}"
                     )
                 else:
                     # Client error (401, 403, etc.) - invalid/expired token
-                    raise AuthError(f"Token refresh failed: {resp.status} - {text}")
+                    raise AuthError(f"Token refresh failed: {resp.status}")
 
             result = await resp.json()
 
             if "access_token" not in result:
-                _LOGGER.error("No access token in refresh response: %s", result)
-                raise AuthError(f"No access token in refresh response: {result}")
+                keys = sorted(result)
+                _LOGGER.error("No access token in refresh response (keys: %s)", keys)
+                raise AuthError(f"No access token in refresh response (keys: {keys})")
 
             expires_in = result.get("expires_in", 3600)
             # Keep the same customer_id and refresh_token if not provided

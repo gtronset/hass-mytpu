@@ -364,6 +364,53 @@ class TestMyTPUAuth:
                 with pytest.raises(AuthError, match="Token refresh failed: 400"):
                     await auth._refresh_token(session)
 
+    async def test_login_error_omits_response_body(self, caplog):
+        """Test login failures don't leak the response body into errors or logs."""
+        html = '<script src="main.abc123.js"></script>'
+        js = 'Authorization:"Basic dGVzdDp0ZXN0"'
+
+        auth = MyTPUAuth()
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                m.get(f"{BASE_URL}/eportal/", status=200, body=html)
+                m.get(f"{BASE_URL}/eportal/main.abc123.js", status=200, body=js)
+                m.post(
+                    f"{BASE_URL}/rest/oauth/token",
+                    status=401,
+                    body='{"secret": "SENSITIVE"}',
+                )
+
+                with (
+                    caplog.at_level("INFO"),
+                    pytest.raises(AuthError) as exc_info,
+                ):
+                    await auth.async_login("user@example.com", "pw", session)
+
+        assert "SENSITIVE" not in str(exc_info.value)
+        assert "SENSITIVE" not in caplog.text
+        assert "user@example.com" not in caplog.text
+
+    async def test_login_missing_access_token_omits_response(self):
+        """Test a login response without access_token isn't echoed in the error."""
+        html = '<script src="main.abc123.js"></script>'
+        js = 'Authorization:"Basic dGVzdDp0ZXN0"'
+
+        auth = MyTPUAuth()
+        async with aiohttp.ClientSession() as session:
+            with aioresponses() as m:
+                m.get(f"{BASE_URL}/eportal/", status=200, body=html)
+                m.get(f"{BASE_URL}/eportal/main.abc123.js", status=200, body=js)
+                m.post(
+                    f"{BASE_URL}/rest/oauth/token",
+                    status=200,
+                    payload={"refresh_token": "SENSITIVE"},
+                )
+
+                with pytest.raises(AuthError, match="keys: \\['refresh_token'\\]") as e:
+                    await auth.async_login("user", "pw", session)
+
+        assert "SENSITIVE" not in str(e.value)
+
     @freeze_time("2026-01-17 12:00:00")
     async def test_refresh_token_server_error(self):
         """Test refresh token handles server errors (5xx)."""
