@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -189,7 +190,8 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     last_power_stat_time = last_power_stat.get("start")
                     last_power_sum = float(last_power_stat.get("sum") or 0.0)
 
-                if self._needs_utc_migration(last_power_stat_time):
+                power_migrated = self._needs_utc_migration(last_power_stat_time)
+                if power_migrated:
                     _LOGGER.info("Migrating power statistics to local-time timestamps")
                     (
                         last_power_sum,
@@ -226,13 +228,16 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "unit": latest.unit,
                     }
 
-                await self._import_cost_statistics(
-                    self.power_service,
-                    "energy",
-                    power_statistic_id,
-                    new_power_stats,
-                    self.config_entry.options.get(CONF_POWER_PRICE_ENTITY),
-                )
+                # Migration only queues its rewrite, so the recorder may still
+                # hold the old timestamps; price days on the next update instead.
+                if not power_migrated:
+                    await self._import_cost_statistics(
+                        self.power_service,
+                        "energy",
+                        power_statistic_id,
+                        new_power_stats,
+                        self.config_entry.options.get(CONF_POWER_PRICE_ENTITY),
+                    )
 
             # Fetch and import water usage statistics
             if self.water_service:
@@ -252,7 +257,8 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     last_water_stat_time = last_water_stat.get("start")
                     last_water_sum = float(last_water_stat.get("sum") or 0.0)
 
-                if self._needs_utc_migration(last_water_stat_time):
+                water_migrated = self._needs_utc_migration(last_water_stat_time)
+                if water_migrated:
                     _LOGGER.info("Migrating water statistics to local-time timestamps")
                     (
                         last_water_sum,
@@ -289,13 +295,16 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "unit": latest.unit,
                     }
 
-                await self._import_cost_statistics(
-                    self.water_service,
-                    "water",
-                    water_statistic_id,
-                    new_water_stats,
-                    self.config_entry.options.get(CONF_WATER_PRICE_ENTITY),
-                )
+                # Migration only queues its rewrite, so the recorder may still
+                # hold the old timestamps; price days on the next update instead.
+                if not water_migrated:
+                    await self._import_cost_statistics(
+                        self.water_service,
+                        "water",
+                        water_statistic_id,
+                        new_water_stats,
+                        self.config_entry.options.get(CONF_WATER_PRICE_ENTITY),
+                    )
 
             # Save token data again in case it was refreshed during usage fetching
             await self._save_token_data()
@@ -537,12 +546,15 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("Price entity %s not found", price_entity)
             return None
         try:
-            return float(state.state)
+            price = float(state.state)
         except (TypeError, ValueError):
+            price = None
+        if price is None or not math.isfinite(price):
             _LOGGER.debug(
                 "Price entity %s has non-numeric state %s", price_entity, state.state
             )
             return None
+        return price
 
     async def _import_cost_statistics(
         self,

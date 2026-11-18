@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -53,6 +54,20 @@ async def test_unavailable_price_skips(
         )
         await coordinator._import_cost_statistics(
             mock_power_service, "energy", ENERGY_ID, [], "input_number.missing"
+        )
+    mock_add.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["nan", "inf", "-inf", "1e309"])
+async def test_non_finite_price_skips(
+    hass: HomeAssistant, make_config_entry, mock_power_service, state
+):
+    """Non-finite prices are treated as unavailable."""
+    coordinator = _coordinator(hass, make_config_entry())
+    hass.states.async_set("input_number.price", state)
+    with patch("custom_components.mytpu.async_add_external_statistics") as mock_add:
+        await coordinator._import_cost_statistics(
+            mock_power_service, "energy", ENERGY_ID, [], "input_number.price"
         )
     mock_add.assert_not_called()
 
@@ -185,3 +200,37 @@ async def test_update_imports_cost_when_configured(
     assert args[2] == ENERGY_ID
     assert args[3][-1]["state"] == 10.0
     assert args[4] == "input_number.price"
+
+
+async def test_update_skips_cost_after_migration(
+    hass: HomeAssistant, make_config_entry
+):
+    """Cost import waits a cycle when this update migrated usage statistics."""
+    base = make_config_entry(include_power=True)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=dict(base.data),
+        options={CONF_POWER_PRICE_ENTITY: "input_number.price"},
+    )
+    coordinator = _coordinator(hass, entry)
+    coordinator.client.get_account_info = AsyncMock()
+    coordinator.client.get_token_data = lambda: entry.data.get("token_data")
+    coordinator.client.get_usage = AsyncMock(return_value=[])
+    old_utc_midnight = datetime(2026, 1, 1, tzinfo=UTC).timestamp()
+    with (
+        patch(
+            "custom_components.mytpu.get_last_statistics",
+            return_value={ENERGY_ID: [{"start": old_utc_midnight, "sum": 5.0}]},
+        ),
+        patch.object(
+            coordinator,
+            "_migrate_statistics",
+            new=AsyncMock(return_value=(5.0, DAY1.timestamp())),
+        ) as mock_migrate,
+        patch.object(
+            coordinator, "_import_cost_statistics", new=AsyncMock()
+        ) as mock_cost,
+    ):
+        await coordinator._do_fetch()
+    mock_migrate.assert_awaited_once()
+    mock_cost.assert_not_called()
