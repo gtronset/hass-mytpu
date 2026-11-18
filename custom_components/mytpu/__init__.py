@@ -190,6 +190,8 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.config_entry = config_entry
         # Keeps scheduled updates and history imports from interleaving writes
         self._update_lock = asyncio.Lock()
+        # Set by a history rewrite whose recorder commit hasn't been confirmed
+        self._history_commit: asyncio.Event | None = None
 
         # Parse service configs from JSON
         self.power_service: Service | None = None
@@ -206,6 +208,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data, re-logging in automatically if token refresh fails."""
         async with self._update_lock:
+            if self._history_commit_pending():
+                # Reading statistics now could continue the old running totals
+                _LOGGER.debug("Skipping update until the history rewrite commits")
+                return self.data or {}
             try:
                 return await self._do_fetch()
             except ServerError as err:
@@ -737,6 +743,11 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ]
 
         async with self._update_lock:
+            if self._history_commit_pending():
+                raise HomeAssistantError(
+                    "The previous history import hasn't been committed by the "
+                    "recorder yet; try again later"
+                )
             try:
                 await self.client.get_account_info()
                 fetched = [
@@ -812,6 +823,12 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if floor is None or day >= floor
         ]
 
+    def _history_commit_pending(self) -> bool:
+        """Return True while a history rewrite awaits recorder confirmation."""
+        if self._history_commit is not None and self._history_commit.is_set():
+            self._history_commit = None
+        return self._history_commit is not None
+
     async def _rewrite_statistics(
         self, service: Service, stat_type: str, readings: list[UsageReading]
     ) -> None:
@@ -819,7 +836,8 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Recorder tasks run in order, so clearing the cost statistic last with
         on_done fires only after the usage rewrite before it is committed.
-        Without the wait, the next update could read the old series.
+        Without the wait, the next update could read the old series. If the
+        wait times out, updates and imports stay blocked until on_done fires.
         """
         statistic_id = self._statistic_id(service, stat_type)
         recorder = get_instance(self.hass)
@@ -827,6 +845,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._import_statistics(service, readings, stat_type)
 
         committed = asyncio.Event()
+        self._history_commit = committed
         recorder.async_clear_statistics(
             [f"{statistic_id}_cost"],
             on_done=lambda: self.hass.loop.call_soon_threadsafe(committed.set),
@@ -834,9 +853,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             async with asyncio.timeout(HISTORY_COMMIT_TIMEOUT_SECONDS):
                 await committed.wait()
-        except TimeoutError:
-            _LOGGER.warning(
-                "Recorder did not confirm the %s history rewrite within %ss",
-                stat_type,
-                HISTORY_COMMIT_TIMEOUT_SECONDS,
-            )
+        except TimeoutError as err:
+            raise HomeAssistantError(
+                f"The recorder didn't confirm the {stat_type} history rewrite "
+                f"within {HISTORY_COMMIT_TIMEOUT_SECONDS}s; updates are paused "
+                "until it does"
+            ) from err
+        self._history_commit = None

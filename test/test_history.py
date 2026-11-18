@@ -175,6 +175,37 @@ class TestImportHistory:
         recorder.async_clear_statistics.assert_not_called()
         assert result == {"water": {"days": 0}}
 
+    async def test_commit_timeout_blocks_until_confirmed(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """A commit timeout fails the action and pauses updates until on_done."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        coordinator.client.get_usage = AsyncMock(side_effect=[[_day(1)], []])
+        coordinator.data = {"power": {"consumption": 1.0}}
+        recorder = MagicMock()  # never calls on_done
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.HISTORY_COMMIT_TIMEOUT_SECONDS", 0.01),
+            patch("custom_components.mytpu.async_add_external_statistics"),
+            pytest.raises(HomeAssistantError, match="updates are paused"),
+        ):
+            await coordinator.async_import_history()
+        coordinator.async_request_refresh.assert_not_awaited()
+
+        # Updates keep the current data and don't touch TPU or statistics
+        coordinator._do_fetch = AsyncMock(return_value={"fresh": True})
+        assert await coordinator._async_update_data() == {"power": {"consumption": 1.0}}
+        coordinator._do_fetch.assert_not_awaited()
+        with pytest.raises(HomeAssistantError, match="hasn't been committed"):
+            await coordinator.async_import_history()
+
+        # The recorder eventually commits; updates resume
+        on_done = recorder.async_clear_statistics.call_args.kwargs["on_done"]
+        on_done()
+        await hass.async_block_till_done()
+        assert await coordinator._async_update_data() == {"fresh": True}
+
 
 class TestImportHistoryAction:
     """The mytpu.import_history action."""
