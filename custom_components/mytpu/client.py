@@ -74,7 +74,13 @@ class MyTPUClient:
         ) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                raise MyTPUError(f"API request failed: {resp.status} - {text}")
+                _LOGGER.debug(
+                    "API request to %s failed with status %s: %.200s",
+                    endpoint,
+                    resp.status,
+                    text,
+                )
+                raise MyTPUError(f"API request failed: {resp.status}")
 
             return await resp.json()
 
