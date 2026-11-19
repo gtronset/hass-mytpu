@@ -36,7 +36,7 @@ from homeassistant.const import (
     UnitOfEnergy,
     UnitOfVolume,
 )
-from homeassistant.core import SupportsResponse
+from homeassistant.core import CoreState, SupportsResponse
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     HomeAssistantError,
@@ -44,6 +44,7 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -252,6 +253,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.rates: dict[str, dict[str, Any]] = {}
         self._last_billing_check: datetime | None = None
         self._force_cost_rebuild = False
+        self._started_refresh_scheduled = False
 
         if hass.config.currency != BILLING_CURRENCY:
             _LOGGER.warning(
@@ -316,7 +318,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ).lower()
                     + "_energy"
                 )
-                last_power_stats = await self.hass.async_add_executor_job(
+                last_power_stats = await get_instance(self.hass).async_add_executor_job(
                     get_last_statistics, self.hass, 1, power_statistic_id, True, {"sum"}
                 )
                 last_power_stat_time: float | None = None
@@ -383,7 +385,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ).lower()
                     + "_water"
                 )
-                last_water_stats = await self.hass.async_add_executor_job(
+                last_water_stats = await get_instance(self.hass).async_add_executor_job(
                     get_last_statistics, self.hass, 1, water_statistic_id, True, {"sum"}
                 )
                 last_water_stat_time: float | None = None
@@ -445,7 +447,12 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Migration only queues its rewrite, so the recorder may still hold
             # the old timestamps; price those days on the next update instead.
             rebuilt: set[str] = set()
-            if not any(job[5] for job in cost_jobs):
+            if self.hass.state is not CoreState.running:
+                # The recorder doesn't commit writes until Home Assistant has
+                # started, so steps that wait on it would block startup; they
+                # run in a refresh once startup finishes
+                self._refresh_when_started()
+            elif not any(job[5] for job in cost_jobs):
                 rebuilt = await self._maybe_rebuild_billed_costs(cost_jobs)
                 # Days skipped earlier for lack of an estimate are filled once
                 # one exists; the incremental import only prices later days
@@ -489,6 +496,17 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(
                 f"Unexpected error communicating with TPU: {err}"
             ) from err
+
+    def _refresh_when_started(self) -> None:
+        """Request one refresh once Home Assistant has finished starting."""
+        if self._started_refresh_scheduled:
+            return
+        self._started_refresh_scheduled = True
+
+        async def _refresh(hass: HomeAssistant) -> None:
+            await self.async_request_refresh()
+
+        self.config_entry.async_on_unload(async_at_started(self.hass, _refresh))
 
     async def _relogin_or_raise(self, original_err: Exception) -> None:
         """Re-login using stored credentials, or raise ConfigEntryAuthFailed."""
@@ -554,7 +572,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Returns (last_cumulative_sum, last_stat_time) so the caller can compute
         an incremental from_date without re-querying TPU for historical data.
         """
-        all_stats = await self.hass.async_add_executor_job(
+        all_stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
             datetime(1970, 1, 1, tzinfo=UTC),
@@ -750,7 +768,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         cost_statistic_id = f"{consumption_statistic_id}_cost"
-        last_cost_stats = await self.hass.async_add_executor_job(
+        last_cost_stats = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics, self.hass, 1, cost_statistic_id, True, {"sum"}
         )
         last_cost_time: float | None = None
@@ -765,7 +783,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if last_cost_time is not None
             else datetime(1970, 1, 1, tzinfo=UTC)
         )
-        existing = await self.hass.async_add_executor_job(
+        existing = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
             query_start,
@@ -1206,7 +1224,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         leaves out the synthetic zero row the series opens with the day before
         its first reading. Real zero-usage days come later and are kept.
         """
-        usage = await self.hass.async_add_executor_job(
+        usage = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
             datetime(1970, 1, 1, tzinfo=UTC),
@@ -1332,7 +1350,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         metadata = self._cost_metadata(service, stat_type)
         cost_id = metadata["statistic_id"]
-        existing = await self.hass.async_add_executor_job(
+        existing = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
             datetime(1970, 1, 1, tzinfo=UTC),

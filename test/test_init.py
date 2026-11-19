@@ -679,6 +679,9 @@ class TestTPUDataUpdateCoordinator:
         # Old-format: stored at UTC midnight (PST would be 08:00 UTC)
         old_stat_time = datetime(2025, 1, 14, 0, 0, tzinfo=UTC).timestamp()
         mock_recorder = MagicMock()
+        mock_recorder.async_add_executor_job = AsyncMock(
+            side_effect=lambda f, *a: f(*a)
+        )
 
         existing_stats = {
             "sum": 100.0,
