@@ -44,6 +44,7 @@ def _recorder() -> MagicMock:
             on_done()
 
     recorder.async_clear_statistics.side_effect = clear
+    recorder.async_add_executor_job = AsyncMock(side_effect=lambda func, *a: func(*a))
     return recorder
 
 
@@ -216,6 +217,7 @@ class TestImportHistory:
         coordinator.client.get_usage = AsyncMock(side_effect=[[_day(1)], []])
         coordinator.data = {"power": {"consumption": 1.0}}
         recorder = MagicMock()  # never calls on_done
+        recorder.async_add_executor_job = AsyncMock(side_effect=lambda f, *a: f(*a))
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
@@ -248,6 +250,7 @@ class TestImportHistory:
         old = _coordinator(hass, entry)
         old.client.get_usage = AsyncMock(side_effect=[[_day(1)], []])
         recorder = MagicMock()  # never calls on_done
+        recorder.async_add_executor_job = AsyncMock(side_effect=lambda f, *a: f(*a))
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),

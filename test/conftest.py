@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -43,6 +43,28 @@ def utc_timezone():
 
 
 # Custom component fixtures
+def _run_in_place(func, *args):
+    """Stand-in for the recorder's executor: run the job right away."""
+    return func(*args)
+
+
+@pytest.fixture(autouse=True)
+def recorder_executor(request):
+    """Give tests without a real recorder one whose executor runs jobs in place.
+
+    Statistics are read through the recorder's executor. Tests using the real
+    recorder (recorder_mock) are left alone; tests patching get_instance
+    themselves override this.
+    """
+    if "recorder_mock" in request.fixturenames:
+        yield None
+        return
+    recorder = MagicMock()
+    recorder.async_add_executor_job = AsyncMock(side_effect=_run_in_place)
+    with patch("custom_components.mytpu.get_instance", return_value=recorder):
+        yield recorder
+
+
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations):
     """Enable custom integrations for all tests."""

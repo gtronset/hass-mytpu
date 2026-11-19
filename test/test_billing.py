@@ -8,7 +8,8 @@ import aiohttp
 import pytest
 from aioresponses import aioresponses
 from homeassistant.components.recorder.models import StatisticData
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from custom_components.mytpu import TPUDataUpdateCoordinator
@@ -251,6 +252,7 @@ def _recorder() -> MagicMock:
             on_done()
 
     recorder.async_clear_statistics.side_effect = clear
+    recorder.async_add_executor_job = AsyncMock(side_effect=lambda func, *a: func(*a))
     return recorder
 
 
@@ -975,3 +977,32 @@ class TestThirdReview:
             await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == set()
         )
         assert coordinator._needs_reprice == {"power"}
+
+
+class TestStartup:
+    """Recorder-waiting steps are deferred until Home Assistant has started."""
+
+    async def test_rebuild_waits_for_startup(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """During startup the rebuild is skipped, then runs in a refresh after start."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        coordinator.client.get_token_data = lambda: None
+        coordinator.client.get_usage = AsyncMock(return_value=[])
+        coordinator._maybe_rebuild_billed_costs = AsyncMock(return_value=set())
+        coordinator._import_cost_statistics = AsyncMock()
+        coordinator.async_request_refresh = AsyncMock()
+        hass.set_state(CoreState.starting)
+
+        with patch("custom_components.mytpu.get_last_statistics", return_value={}):
+            await coordinator._do_fetch()
+            await coordinator._do_fetch()  # schedules the refresh only once
+
+        coordinator._maybe_rebuild_billed_costs.assert_not_awaited()
+        coordinator._import_cost_statistics.assert_awaited()  # doesn't wait; still runs
+        coordinator.async_request_refresh.assert_not_awaited()
+
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+        coordinator.async_request_refresh.assert_awaited_once()
