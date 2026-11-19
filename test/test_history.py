@@ -6,8 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import (
+    HomeAssistantError,
+    ServiceValidationError,
+    Unauthorized,
+)
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -221,6 +225,26 @@ class TestImportHistoryAction:
                 blocking=True,
                 return_response=True,
             )
+
+    async def test_requires_admin(self, hass: HomeAssistant, hass_read_only_user):
+        """Non-admin users can't run the import."""
+        await async_setup(hass, {})
+        entry = MockConfigEntry(domain=DOMAIN, state=ConfigEntryState.LOADED)
+        entry.add_to_hass(hass)
+        coordinator = MagicMock()
+        coordinator.async_import_history = AsyncMock(return_value={})
+        hass.data[DOMAIN] = {entry.entry_id: {"coordinator": coordinator}}
+
+        with pytest.raises(Unauthorized):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_IMPORT_HISTORY,
+                {"config_entry_id": entry.entry_id},
+                blocking=True,
+                return_response=True,
+                context=Context(user_id=hass_read_only_user.id),
+            )
+        coordinator.async_import_history.assert_not_awaited()
 
     async def test_calls_coordinator(self, hass: HomeAssistant):
         """The action passes the start date through and returns the result."""

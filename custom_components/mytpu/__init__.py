@@ -41,6 +41,7 @@ from homeassistant.exceptions import (
     ServiceValidationError,
 )
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -114,7 +115,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         ]
         return await coordinator.async_import_history(call.data.get(ATTR_START_DATE))
 
-    hass.services.async_register(
+    # Admin-only: the import replaces the account's usage and cost statistics
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_IMPORT_HISTORY,
         _async_import_history,

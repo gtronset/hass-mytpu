@@ -107,7 +107,7 @@ replace the usage statistics. If a request fails, the existing statistics are
 left alone. Cost statistics are then cleared and rebuilt at the current price.
 
 The action returns the number of days and the date range imported for each
-meter. Taking a Home Assistant backup first is a good idea, since the existing
+meter. It can only be run by an administrator. Taking a Home Assistant backup first is a good idea, since the existing
 usage statistics are replaced.
 
 ## Acknowledgments
