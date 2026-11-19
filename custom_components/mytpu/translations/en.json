@@ -50,7 +50,7 @@
     "step": {
       "init": {
         "title": "Configure Options",
-        "description": "Optionally pick an entity holding the current price (USD/kWh for power, USD/CCF for water). When set, daily cost statistics are imported alongside usage for the Energy Dashboard's \"entity tracking the total costs\" option.",
+        "description": "Costs for billed days come from your MyTPU bills. Optionally pick an entity holding your current price (per kWh for power, per CCF for water) to estimate costs for days since the last bill.",
         "data": {
           "update_interval_hours": "Update Interval (hours)",
           "power_price_entity": "Power price entity (per kWh)",
@@ -62,7 +62,7 @@
   "services": {
     "import_history": {
       "name": "Import history",
-      "description": "Replaces the usage statistics with all history MyTPU still has (about two years), then rebuilds cost statistics at the current price.",
+      "description": "Replaces the usage statistics with all history MyTPU still has (about two years), then rebuilds cost statistics from your bills.",
       "fields": {
         "config_entry_id": {
           "name": "Account",

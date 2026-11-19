@@ -22,7 +22,7 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from custom_components.mytpu import TPUDataUpdateCoordinator
 from custom_components.mytpu.const import DOMAIN
-from custom_components.mytpu.models import UsageReading
+from custom_components.mytpu.models import Bill, UsageReading
 
 ENERGY_ID = f"{DOMAIN}:p_mock_power_meter_energy"
 
@@ -78,3 +78,38 @@ async def test_rewrite_committed_before_return(hass: HomeAssistant, make_config_
         get_last_statistics, hass, 1, f"{ENERGY_ID}_cost", True, {"sum"}
     )
     assert cost == {}
+
+
+async def test_billed_cost_rebuild_committed_before_return(
+    hass: HomeAssistant, make_config_entry
+):
+    """With a real recorder, rebuilt costs are readable once the rebuild returns."""
+    entry = make_config_entry(include_power=True)
+    coordinator = cast(Any, TPUDataUpdateCoordinator(hass, AsyncMock(), entry))
+    service = coordinator.power_service
+    invoice = dt_util.as_local(_day(0).date).date()
+    readings = [
+        UsageReading(
+            date=r.date,
+            consumption=r.consumption,
+            unit=r.unit,
+            invoice_date=invoice,
+            billed_consumption=2.0,
+        )
+        for r in (_day(2), _day(1))
+    ]
+    await coordinator._import_statistics(service, readings, "energy")
+    await async_wait_recording_done(hass)
+
+    coordinator.client.get_billing_history = AsyncMock(
+        return_value=[Bill(date=invoice, amounts={"Power": 5.0})]
+    )
+    coordinator._fetch_history = AsyncMock(return_value=readings)
+    job = (service, "energy", ENERGY_ID, [], None, False)
+    assert await coordinator._maybe_rebuild_billed_costs([job])
+
+    # No extra wait: the rebuild must not return before the recorder commits
+    cost = await hass.async_add_executor_job(
+        get_last_statistics, hass, 1, f"{ENERGY_ID}_cost", True, {"sum"}
+    )
+    assert cost[f"{ENERGY_ID}_cost"][0]["sum"] == 5.0

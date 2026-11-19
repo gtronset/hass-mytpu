@@ -22,6 +22,17 @@ DAY2 = DAY1 + timedelta(days=1)
 DAY3 = DAY2 + timedelta(days=1)
 
 
+@pytest.fixture(autouse=True)
+def no_billed_cost_rebuild():
+    """Usage-import tests run without the bill-based cost rebuild (see test_billing)."""
+    with patch.object(
+        TPUDataUpdateCoordinator,
+        "_maybe_rebuild_billed_costs",
+        new=AsyncMock(return_value=False),
+    ):
+        yield
+
+
 def _coordinator(hass, entry):
     return TPUDataUpdateCoordinator(hass, AsyncMock(), entry)
 

@@ -26,3 +26,18 @@ HISTORY_CHUNK_DAYS = 365
 MAX_HISTORY_CHUNKS = 10
 # How long to wait for the recorder to commit a history rewrite
 HISTORY_COMMIT_TIMEOUT_SECONDS = 300
+
+# The categories the MyTPU billing history page requests
+BILLING_CATEGORIES = [
+    "Power",
+    "Water",
+    "Wastewater",
+    "Solid Waste",
+    "Surface Water",
+    "AdjDepFee",
+]
+# Billing division that charges for each meter's usage, by service type
+BILLING_DIVISIONS = {"P": "Power", "W": "Water"}
+# How often to check for new bills, and how far back to request them
+BILLING_CHECK_INTERVAL_HOURS = 24
+BILLING_HISTORY_DAYS = 760

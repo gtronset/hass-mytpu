@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 import aiohttp
 
 from .auth import BASE_URL, MyTPUAuth
-from .models import Service, UsageReading
+from .const import BILLING_CATEGORIES
+from .models import Bill, Service, UsageReading
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -175,6 +176,49 @@ class MyTPUClient:
 
         return readings
 
+    async def get_billing_history(
+        self, from_date: datetime, to_date: datetime
+    ) -> list[Bill]:
+        """Fetch billing statements with their charges per service division.
+
+        Sends the same request as the MyTPU billing history page.
+        """
+        if self._account_context is None:
+            await self.get_account_info()
+
+        data = {
+            "customerId": self._auth.customer_id,
+            "accountContext": self._account_context,
+            "parentAcctContext": None,
+            "csrViewOnly": "N",
+            "billingCategory": BILLING_CATEGORIES,
+            "fromDate": from_date.strftime("%Y-%m-%d"),
+            "toDate": to_date.strftime("%Y-%m-%d"),
+        }
+        result = await self._request("POST", "/rest/billing/history", data)
+
+        # Each statement lists one child per division, dated like "2026-11-03"
+        by_date: dict[str, dict[str, float]] = {}
+        for statement in result.get("billingData") or []:
+            for part in statement.get("bills") or []:
+                division = part.get("division")
+                billed_on = part.get("billingDate")
+                amount = _parse_amount(part.get("paymentAmount"))
+                if not division or not billed_on or amount is None:
+                    continue
+                amounts = by_date.setdefault(billed_on, {})
+                amounts[division] = amounts.get(division, 0.0) + amount
+
+        bills = []
+        for billed_on, amounts in by_date.items():
+            try:
+                bill_date = datetime.strptime(billed_on, "%Y-%m-%d").date()
+            except ValueError:
+                _LOGGER.debug("Skipping bill with unexpected date %r", billed_on)
+                continue
+            bills.append(Bill(date=bill_date, amounts=amounts))
+        return sorted(bills, key=lambda bill: bill.date)
+
     async def async_login(self, username: str, password: str) -> None:
         """Perform a full login with username and password."""
         session = await self._ensure_session()
@@ -189,3 +233,13 @@ class MyTPUClient:
         if self._session:
             await self._session.close()
             self._session = None
+
+
+def _parse_amount(value: object) -> float | None:
+    """Parse a dollar amount like "98.11" or "$1,234.56"."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(str(value).replace("$", "").replace(",", ""))
+    except ValueError:
+        return None

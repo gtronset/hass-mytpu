@@ -72,20 +72,30 @@ a day or more behind, so recent days fill in later.
 ### Costs
 
 Home Assistant can't apply a price entity or a static price to external
-statistics, so the integration can import cost statistics for you:
+statistics, so the integration imports cost statistics itself:
+`mytpu:p_<meter>_energy_cost` and `mytpu:w_<meter>_water_cost`, in your Home
+Assistant currency.
 
-1. Create an entity holding the current price, e.g. an `input_number` or a
-   template sensor, in your currency per kWh (power) or per CCF (water).
-2. Open the integration's **Configure** dialog and pick it as the power and/or
-   water price entity.
-3. On the next update the integration writes `mytpu:p_<meter>_energy_cost`
-   (and `mytpu:w_<meter>_water_cost`), backfilling all imported history.
-4. In the Energy settings, choose **Use an entity tracking the total costs** and
-   select the "TPU Energy cost …" (or "TPU Water cost …") statistic.
+**Billed days come from your actual MyTPU bills.** Once a day the integration
+checks your billing history. When a new statement appears, it rebuilds the cost
+series: each billed day costs its usage times that bill's effective rate (the
+bill's Electricity or Drinking water amount divided by the usage it charged
+for). Totals per bill match what you were charged, including that service's
+fixed charges and taxes. Wastewater, solid waste and stormwater aren't included.
 
-Each day is priced once, at the price current when that day is first written.
-Changing the price later affects only days imported after the change; the
-backfill uses the price current at the time it runs.
+**Days since the last bill use an estimate.** To price them, create an entity
+holding your current price, e.g. an `input_number` or a template sensor, per
+kWh (power) or per CCF (water), and pick it as the power and/or water price
+entity in the integration's **Configure** dialog. Without one, those days stay
+unpriced until they're billed. When the next bill arrives, it replaces the
+estimates for its days.
+
+In the Energy settings, choose **Use an entity tracking the total costs** and
+select the "TPU Energy cost …" (or "TPU Water cost …") statistic.
+
+Fixed charges are spread by usage, so a bill's total is exact but busier days
+carry more of it. This matters most for water, where fixed charges are a large
+part of the bill.
 
 ## Importing History
 
@@ -104,7 +114,7 @@ data:
 The integration fetches history backward from today, a year at a time, until
 MyTPU returns no more readings. Only once every meter has been fetched does it
 replace the usage statistics. If a request fails, the existing statistics are
-left alone. Cost statistics are then cleared and rebuilt at the current price.
+left alone. Cost statistics are then rebuilt from your bills.
 
 The action returns the number of days and the date range imported for each
 meter. It can only be run by an administrator. Taking a Home Assistant backup first is a good idea, since the existing
