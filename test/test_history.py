@@ -20,6 +20,7 @@ from custom_components.mytpu.client import MyTPUError
 from custom_components.mytpu.const import (
     DOMAIN,
     HISTORY_CHUNK_DAYS,
+    HISTORY_OVERLAP_DAYS,
     MAX_HISTORY_CHUNKS,
     SERVICE_IMPORT_HISTORY,
 )
@@ -74,8 +75,10 @@ class TestFetchHistory:
 
         calls = coordinator.client.get_usage.call_args_list
         assert len(calls) == 3
-        # Each chunk ends where the previous one started
-        assert calls[1].kwargs["to_date"] == calls[0].kwargs["from_date"]
+        # Each chunk overlaps the newer one so its billed days carry invoices
+        assert calls[1].kwargs["to_date"] == calls[0].kwargs["from_date"] + timedelta(
+            days=HISTORY_OVERLAP_DAYS
+        )
         assert calls[0].kwargs["to_date"] - calls[0].kwargs["from_date"] == (
             timedelta(days=HISTORY_CHUNK_DAYS)
         )
@@ -84,6 +87,26 @@ class TestFetchHistory:
             boundary.date,
             _day(1).date,
         ]
+
+    async def test_overlap_prefers_rows_with_invoice(
+        self, hass: HomeAssistant, make_config_entry, mock_power_service
+    ):
+        """A day returned by two chunks keeps the copy that carries its invoice."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        unlabeled = _day(HISTORY_CHUNK_DAYS + 1)
+        labeled = UsageReading(
+            date=unlabeled.date,
+            consumption=unlabeled.consumption,
+            unit=unlabeled.unit,
+            invoice_date=date(2026, 1, 1),
+        )
+        coordinator.client.get_usage = AsyncMock(
+            side_effect=[[_day(1)], [unlabeled], [labeled], []]
+        )
+
+        readings = await coordinator._fetch_history(mock_power_service, None)
+
+        assert readings[0].invoice_date == date(2026, 1, 1)
 
     async def test_start_date_limits_range(
         self, hass: HomeAssistant, make_config_entry, mock_power_service
@@ -115,22 +138,24 @@ class TestFetchHistory:
 class TestImportHistory:
     """Rewriting statistics from fetched history."""
 
-    async def test_rewrites_usage_and_clears_cost(
+    async def test_rewrites_usage_and_keeps_cost(
         self, hass: HomeAssistant, make_config_entry
     ):
-        """Usage is cleared and rewritten, costs cleared last, then a refresh."""
+        """Usage is rewritten, costs are kept for repricing, then a refresh."""
         coordinator = _coordinator(hass, make_config_entry(include_power=True))
         coordinator.client.get_usage = AsyncMock(side_effect=[[_day(2), _day(1)], []])
         recorder = _recorder()
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
         ):
             result = await coordinator.async_import_history()
 
         clears = [c.args[0] for c in recorder.async_clear_statistics.call_args_list]
-        assert clears == [[ENERGY_ID], [f"{ENERGY_ID}_cost"]]
+        # Clear usage, then an empty clear that only waits for the commit
+        assert clears == [[ENERGY_ID], []]
         assert recorder.async_clear_statistics.call_args.kwargs["on_done"]
         stats = mock_add.call_args.args[2]
         # Baseline row plus both days, with the running total starting from zero
@@ -158,6 +183,7 @@ class TestImportHistory:
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             pytest.raises(HomeAssistantError, match="Fetching history"),
         ):
             await coordinator.async_import_history()
@@ -173,7 +199,10 @@ class TestImportHistory:
         coordinator.client.get_usage = AsyncMock(return_value=[])
         recorder = _recorder()
 
-        with patch("custom_components.mytpu.get_instance", return_value=recorder):
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
+        ):
             result = await coordinator.async_import_history()
 
         recorder.async_clear_statistics.assert_not_called()
@@ -190,6 +219,7 @@ class TestImportHistory:
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             patch("custom_components.mytpu.HISTORY_COMMIT_TIMEOUT_SECONDS", 0.01),
             patch("custom_components.mytpu.async_add_external_statistics"),
             pytest.raises(HomeAssistantError, match="updates are paused"),
@@ -221,6 +251,7 @@ class TestImportHistory:
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             patch("custom_components.mytpu.HISTORY_COMMIT_TIMEOUT_SECONDS", 0.01),
             patch("custom_components.mytpu.async_add_external_statistics"),
             pytest.raises(HomeAssistantError, match="updates are paused"),

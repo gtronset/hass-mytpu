@@ -15,6 +15,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from custom_components.mytpu.const import CONF_POWER_SERVICE, CONF_WATER_SERVICE, DOMAIN
 from custom_components.mytpu.sensor import (
     TPUEnergySensor,
+    TPURateSensor,
     TPUWaterSensor,
     async_setup_entry,
 )
@@ -35,9 +36,12 @@ async def test_async_setup_entry_both_services(hass: HomeAssistant, mock_config_
         hass, mock_config_entry, cast(AddEntitiesCallback, mock_add_entities)
     )
 
-    assert len(entities) == 2
-    assert isinstance(entities[0], TPUEnergySensor)
-    assert isinstance(entities[1], TPUWaterSensor)
+    assert [type(e) for e in entities] == [
+        TPUEnergySensor,
+        TPURateSensor,
+        TPUWaterSensor,
+        TPURateSensor,
+    ]
 
 
 @pytest.mark.asyncio
@@ -81,8 +85,7 @@ async def test_async_setup_entry_power_only(hass: HomeAssistant, mock_power_serv
         hass, power_only_entry, cast(AddEntitiesCallback, mock_add_entities)
     )
 
-    assert len(entities) == 1
-    assert isinstance(entities[0], TPUEnergySensor)
+    assert [type(e) for e in entities] == [TPUEnergySensor, TPURateSensor]
 
 
 @pytest.mark.asyncio
@@ -126,8 +129,7 @@ async def test_async_setup_entry_water_only(hass: HomeAssistant, mock_water_serv
         hass, water_only_entry, cast(AddEntitiesCallback, mock_add_entities)
     )
 
-    assert len(entities) == 1
-    assert isinstance(entities[0], TPUWaterSensor)
+    assert [type(e) for e in entities] == [TPUWaterSensor, TPURateSensor]
 
 
 class TestTPUEnergySensor:
@@ -272,3 +274,48 @@ class TestTPUWaterSensor:
         attrs = sensor.extra_state_attributes
 
         assert attrs == {}
+
+
+class TestTPURateSensor:
+    """Rate sensors from bills."""
+
+    def _sensor(self, mock_config_entry, rates, service="water"):
+        coordinator = MagicMock()
+        coordinator.hass.config.currency = "EUR"  # rates stay in the bills' USD
+        coordinator.rates = rates
+        return TPURateSensor(
+            coordinator,
+            mock_config_entry,
+            "_water_rate",
+            service,
+            "water_rate",
+            UnitOfVolume.CENTUM_CUBIC_FEET,
+        )
+
+    def test_state_and_attributes(self, mock_config_entry):
+        """The state is the trailing rate; attributes describe the last bill."""
+        sensor = self._sensor(
+            mock_config_entry,
+            {
+                "water": {
+                    "rate": 11.2,
+                    "bills": 12,
+                    "last_bill_rate": 15.95,
+                    "last_bill_date": "2026-11-03",
+                }
+            },
+        )
+        assert sensor.native_value == 11.2
+        assert sensor.native_unit_of_measurement == "USD/CCF"
+        assert sensor.unique_id == f"{mock_config_entry.entry_id}_water_rate"
+        assert sensor.extra_state_attributes == {
+            "last_bill_rate": 15.95,
+            "last_bill_date": "2026-11-03",
+            "bills": 12,
+        }
+
+    def test_no_bills_yet(self, mock_config_entry):
+        """Before any bill has been priced, the rate is unknown."""
+        sensor = self._sensor(mock_config_entry, {})
+        assert sensor.native_value is None
+        assert sensor.extra_state_attributes == {}

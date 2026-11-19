@@ -28,6 +28,17 @@ from custom_components.mytpu.const import (
 from custom_components.mytpu.models import Service, ServiceType, UsageReading
 
 
+@pytest.fixture(autouse=True)
+def no_billed_cost_rebuild():
+    """Usage-import tests run without the bill-based cost rebuild (see test_billing)."""
+    with patch.object(
+        TPUDataUpdateCoordinator,
+        "_maybe_rebuild_billed_costs",
+        new=AsyncMock(return_value=set()),
+    ):
+        yield
+
+
 def test_service_from_config(mock_power_service):
     """Test reconstructing Service from JSON config."""
     service_json = json.dumps(

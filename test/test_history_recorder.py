@@ -13,6 +13,7 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -22,7 +23,7 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from custom_components.mytpu import TPUDataUpdateCoordinator
 from custom_components.mytpu.const import DOMAIN
-from custom_components.mytpu.models import UsageReading
+from custom_components.mytpu.models import Bill, UsageReading
 
 ENERGY_ID = f"{DOMAIN}:p_mock_power_meter_energy"
 
@@ -74,7 +75,138 @@ async def test_rewrite_committed_before_return(hass: HomeAssistant, make_config_
         get_last_statistics, hass, 1, ENERGY_ID, True, {"sum"}
     )
     assert last[ENERGY_ID][0]["sum"] == 3.0
+    # Costs are kept for the following rebuild to reprice
     cost = await hass.async_add_executor_job(
         get_last_statistics, hass, 1, f"{ENERGY_ID}_cost", True, {"sum"}
     )
-    assert cost == {}
+    assert cost[f"{ENERGY_ID}_cost"][0]["sum"] == 50.0
+
+
+async def test_billed_cost_rebuild_committed_before_return(
+    hass: HomeAssistant, make_config_entry
+):
+    """With a real recorder, rebuilt costs are readable once the rebuild returns."""
+    entry = make_config_entry(include_power=True)
+    coordinator = cast(Any, TPUDataUpdateCoordinator(hass, AsyncMock(), entry))
+    service = coordinator.power_service
+    invoice = dt_util.as_local(_day(0).date).date()
+    readings = [
+        UsageReading(
+            date=r.date,
+            consumption=r.consumption,
+            unit=r.unit,
+            invoice_date=invoice,
+            billed_consumption=2.0,
+        )
+        for r in (_day(2), _day(1))
+    ]
+    await coordinator._import_statistics(service, readings, "energy")
+    await async_wait_recording_done(hass)
+
+    coordinator.client.get_billing_history = AsyncMock(
+        return_value=[Bill(date=invoice, amounts={"Power": 5.0})]
+    )
+    coordinator.client.get_services = AsyncMock(return_value=[service])
+    coordinator._fetch_history = AsyncMock(return_value=readings)
+    job = (service, "energy", ENERGY_ID, [], None, False)
+    assert await coordinator._maybe_rebuild_billed_costs([job]) == {"energy"}
+
+    # No extra wait: the rebuild must not return before the recorder commits
+    cost = await hass.async_add_executor_job(
+        get_last_statistics, hass, 1, f"{ENERGY_ID}_cost", True, {"sum"}
+    )
+    assert cost[f"{ENERGY_ID}_cost"][0]["sum"] == 5.0
+
+
+async def test_import_keeps_days_tpu_no_longer_returns(
+    hass: HomeAssistant, make_config_entry
+):
+    """With a real recorder, stored days older than TPU's history survive an import."""
+    entry = make_config_entry(include_power=True)
+    coordinator = cast(Any, TPUDataUpdateCoordinator(hass, AsyncMock(), entry))
+    coordinator.client.get_token_data = lambda: entry.data.get("token_data")
+    coordinator.async_request_refresh = AsyncMock()
+    service = coordinator.power_service
+    await coordinator._import_statistics(service, [_day(10), _day(3)], "energy")
+    await async_wait_recording_done(hass)
+
+    coordinator.client.get_usage = AsyncMock(side_effect=[[_day(4), _day(3)], []])
+    await coordinator.async_import_history()
+
+    rows = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utcnow() - timedelta(days=30),
+        None,
+        {ENERGY_ID},
+        "hour",
+        None,
+        {"sum"},
+    )
+    starts = [row["start"] for row in rows[ENERGY_ID]]
+    assert _day(10).date.timestamp() in starts
+    assert rows[ENERGY_ID][-1]["sum"] == 3.0  # days 10, 4 and 3
+
+
+async def test_correction_keeps_usage_queued_this_update(
+    hass: HomeAssistant, make_config_entry
+):
+    """With a real recorder, a correction and a day queued this update both land.
+
+    The test recorder commits quickly enough that the race this guards against
+    doesn't reproduce here; test_billing checks the rebuild waits for queued
+    usage before looking for corrections.
+    """
+    entry = make_config_entry(include_power=True)
+    coordinator = cast(Any, TPUDataUpdateCoordinator(hass, AsyncMock(), entry))
+    service = coordinator.power_service
+    invoice = dt_util.as_local(_day(0).date).date()
+
+    def labeled(reading, consumption):
+        return UsageReading(
+            date=reading.date,
+            consumption=consumption,
+            unit=reading.unit,
+            invoice_date=invoice,
+            billed_consumption=3.0,
+        )
+
+    await coordinator._import_statistics(service, [_day(3)], "energy")
+    await async_wait_recording_done(hass)
+
+    # This update queues a new day without waiting for it to commit...
+    last = await hass.async_add_executor_job(
+        get_last_statistics, hass, 1, ENERGY_ID, True, {"sum"}
+    )
+    new_stats = await coordinator._import_statistics(
+        service,
+        [_day(2)],
+        "energy",
+        cumulative_sum=last[ENERGY_ID][0]["sum"],
+        last_stat_time=last[ENERGY_ID][0]["start"],
+    )
+    # ...then the rebuild finds day 3 corrected from 1 to 2 kWh
+    coordinator.client.get_billing_history = AsyncMock(
+        return_value=[Bill(date=invoice, amounts={"Power": 3.0})]
+    )
+    coordinator.client.get_services = AsyncMock(return_value=[service])
+    coordinator._fetch_history = AsyncMock(
+        return_value=[labeled(_day(3), 2.0), labeled(_day(2), 1.0)]
+    )
+    job = (service, "energy", ENERGY_ID, new_stats, None, False)
+    assert await coordinator._maybe_rebuild_billed_costs([job]) == {"energy"}
+
+    rows = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utcnow() - timedelta(days=30),
+        None,
+        {ENERGY_ID},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    states = {row["start"]: row["state"] for row in rows[ENERGY_ID]}
+    assert states[_day(2).date.timestamp()] == 1.0  # the queued day survived
+    assert states[_day(3).date.timestamp()] == 2.0  # the correction applied
+    assert rows[ENERGY_ID][-1]["sum"] == 3.0

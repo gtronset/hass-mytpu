@@ -19,10 +19,13 @@ if TYPE_CHECKING:
 
 from . import TPUDataUpdateCoordinator
 from .const import (
+    BILLING_CURRENCY,
     CONF_POWER_SERVICE,
     CONF_WATER_SERVICE,
     DOMAIN,
+    TPU_POWER_RATE_ID_SUFFIX,
     TPU_POWER_SENSOR_ID_SUFFIX,
+    TPU_WATER_RATE_ID_SUFFIX,
     TPU_WATER_SENSOR_ID_SUFFIX,
 )
 
@@ -39,13 +42,33 @@ async def async_setup_entry(
 
     entities: list[SensorEntity] = []
 
-    # Add power sensor if configured
+    # Add power sensors if configured
     if entry.data.get(CONF_POWER_SERVICE):
         entities.append(TPUEnergySensor(coordinator, entry))
+        entities.append(
+            TPURateSensor(
+                coordinator,
+                entry,
+                TPU_POWER_RATE_ID_SUFFIX,
+                "power",
+                "energy_rate",
+                UnitOfEnergy.KILO_WATT_HOUR,
+            )
+        )
 
-    # Add water sensor if configured
+    # Add water sensors if configured
     if entry.data.get(CONF_WATER_SERVICE):
         entities.append(TPUWaterSensor(coordinator, entry))
+        entities.append(
+            TPURateSensor(
+                coordinator,
+                entry,
+                TPU_WATER_RATE_ID_SUFFIX,
+                "water",
+                "water_rate",
+                UnitOfVolume.CENTUM_CUBIC_FEET,
+            )
+        )
 
     async_add_entities(entities)
 
@@ -137,3 +160,43 @@ class TPUWaterSensor(TPUSensor):
             TPU_WATER_SENSOR_ID_SUFFIX,
             "water",
         )
+
+
+class TPURateSensor(TPUSensor):
+    """Effective price per unit from recent bills, used to estimate unbilled days.
+
+    The state is the trailing rate: the total charged over the last 12 bills
+    divided by the usage they billed, including fixed charges and taxes.
+    """
+
+    _attr_suggested_display_precision = 4
+
+    def __init__(
+        self,
+        coordinator: TPUDataUpdateCoordinator,
+        entry: ConfigEntry,
+        unique_id_suffix: str,
+        service_type: str,
+        translation_key: str,
+        unit: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry, unique_id_suffix, service_type)
+        self._attr_translation_key = translation_key
+        # Bills are in US dollars whatever Home Assistant's currency is
+        self._attr_native_unit_of_measurement = f"{BILLING_CURRENCY}/{unit}"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the trailing rate from bills."""
+        return self.coordinator.rates.get(self._service_type, {}).get("rate")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the last bill's rate and how many bills the rate covers."""
+        rates = self.coordinator.rates.get(self._service_type, {})
+        return {
+            key: rates[key]
+            for key in ("last_bill_rate", "last_bill_date", "bills")
+            if key in rates
+        }

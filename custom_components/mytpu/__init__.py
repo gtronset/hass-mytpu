@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse
     from homeassistant.helpers.typing import ConfigType
 
+import aiohttp
 import voluptuous as vol
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -43,6 +44,7 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -51,6 +53,10 @@ from .client import MyTPUClient, MyTPUError
 from .const import (
     ATTR_CONFIG_ENTRY_ID,
     ATTR_START_DATE,
+    BILLING_CHECK_INTERVAL_HOURS,
+    BILLING_CURRENCY,
+    BILLING_DIVISIONS,
+    BILLING_HISTORY_DAYS,
     CONF_POWER_PRICE_ENTITY,
     CONF_POWER_SERVICE,
     CONF_TOKEN_DATA,
@@ -61,15 +67,21 @@ from .const import (
     DOMAIN,
     HISTORY_CHUNK_DAYS,
     HISTORY_COMMIT_TIMEOUT_SECONDS,
+    HISTORY_OVERLAP_DAYS,
     MAX_HISTORY_CHUNKS,
     MIN_UPDATE_INTERVAL_HOURS,
     SERVICE_IMPORT_HISTORY,
+    USAGE_TOLERANCE,
 )
-from .models import Service, ServiceType, UsageReading
+from .models import Bill, Service, ServiceType, UsageReading
+from .pricing import BillUsage, daily_costs, rate_summary, summarize_bills
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+# Coordinator data and rate keys for each usage statistic type
+SERVICE_KEYS = {"energy": "power", "water": "water"}
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -223,6 +235,33 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # rewrite still awaiting the recorder keeps blocking the new one too
         self._guard = _statistics_guard(hass, config_entry.entry_id)
 
+        # A meter's costs are rebuilt from bills when a statement newer than the
+        # last one applied to it appears; applied bills survive restarts.
+        self._billing_store: Store[dict[str, Any]] = Store(
+            hass, 1, f"{DOMAIN}.{config_entry.entry_id}.billing"
+        )
+        # Last bill applied to each meter, by "power"/"water"
+        self._applied_bills: dict[str, str] = {}
+        # Meters whose whole cost series must be repriced (after an import),
+        # and meters with usage days left unpriced for lack of an estimate
+        self._needs_reprice: set[str] = set()
+        self._unpriced: set[str] = set()
+        self._billing_loaded = False
+        self._warned_shared_meters: set[str] = set()
+        # Rates from bills, by "power"/"water": see pricing.rate_summary
+        self.rates: dict[str, dict[str, Any]] = {}
+        self._last_billing_check: datetime | None = None
+        self._force_cost_rebuild = False
+
+        if hass.config.currency != BILLING_CURRENCY:
+            _LOGGER.warning(
+                "MyTPU bills are in %s but Home Assistant's currency is %s; TPU "
+                "cost statistics and rates are recorded in %s",
+                BILLING_CURRENCY,
+                hass.config.currency,
+                BILLING_CURRENCY,
+            )
+
         # Parse service configs from JSON
         self.power_service: Service | None = None
         self.water_service: Service | None = None
@@ -264,6 +303,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._save_token_data()
 
             data: dict[str, Any] = {}
+            # (service, stat_type, statistic_id, new rows, price entity, migrated)
+            cost_jobs: list[
+                tuple[Service, str, str, list[StatisticData], str | None, bool]
+            ] = []
 
             # Fetch and import power usage statistics
             if self.power_service:
@@ -321,16 +364,16 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "unit": latest.unit,
                     }
 
-                # Migration only queues its rewrite, so the recorder may still
-                # hold the old timestamps; price days on the next update instead.
-                if not power_migrated:
-                    await self._import_cost_statistics(
+                cost_jobs.append(
+                    (
                         self.power_service,
                         "energy",
                         power_statistic_id,
                         new_power_stats,
                         self.config_entry.options.get(CONF_POWER_PRICE_ENTITY),
+                        power_migrated,
                     )
+                )
 
             # Fetch and import water usage statistics
             if self.water_service:
@@ -388,15 +431,44 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "unit": latest.unit,
                     }
 
-                # Migration only queues its rewrite, so the recorder may still
-                # hold the old timestamps; price days on the next update instead.
-                if not water_migrated:
-                    await self._import_cost_statistics(
+                cost_jobs.append(
+                    (
                         self.water_service,
                         "water",
                         water_statistic_id,
                         new_water_stats,
                         self.config_entry.options.get(CONF_WATER_PRICE_ENTITY),
+                        water_migrated,
+                    )
+                )
+
+            # Migration only queues its rewrite, so the recorder may still hold
+            # the old timestamps; price those days on the next update instead.
+            rebuilt: set[str] = set()
+            if not any(job[5] for job in cost_jobs):
+                rebuilt = await self._maybe_rebuild_billed_costs(cost_jobs)
+                # Days skipped earlier for lack of an estimate are filled once
+                # one exists; the incremental import only prices later days
+                rebuilt |= await self._reprice_at_estimate(
+                    [
+                        job
+                        for job in cost_jobs
+                        if job[1] not in rebuilt
+                        and SERVICE_KEYS[job[1]] in self._unpriced
+                    ],
+                    fill_only=True,
+                )
+            for (
+                service,
+                stat_type,
+                statistic_id,
+                new_stats,
+                price,
+                migrated,
+            ) in cost_jobs:
+                if not migrated and stat_type not in rebuilt:
+                    await self._import_cost_statistics(
+                        service, stat_type, statistic_id, new_stats, price
                     )
 
             # Save token data again in case it was refreshed during usage fetching
@@ -649,6 +721,13 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return price
 
+    def _estimate_price(self, stat_type: str, price_entity: str | None) -> float | None:
+        """Price for days not yet billed: the price entity, else the bill rate."""
+        price = self._current_price(price_entity)
+        if price is not None:
+            return price
+        return self.rates.get(SERVICE_KEYS[stat_type], {}).get("rate")
+
     async def _import_cost_statistics(
         self,
         service: Service,
@@ -663,9 +742,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         so history is backfilled on first use and days missed while the price
         was unavailable are caught up later. Each day is priced once, at the
         price current when it is first written; later price changes do not
-        rewrite past days.
+        rewrite past days, but the next bill rebuild replaces them. The price
+        is the price entity's value, or else the trailing rate from bills.
         """
-        price = self._current_price(price_entity)
+        price = self._estimate_price(stat_type, price_entity)
         if price is None:
             return
 
@@ -734,17 +814,22 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             )
 
+        async_add_external_statistics(
+            self.hass, self._cost_metadata(service, stat_type), statistics
+        )
+
+    def _cost_metadata(self, service: Service, stat_type: str) -> StatisticMetaData:
+        """Return metadata for a meter's cost statistic."""
         label = "Energy" if stat_type == "energy" else "Water"
-        metadata = StatisticMetaData(
+        return StatisticMetaData(
             mean_type=StatisticMeanType.NONE,
             has_sum=True,
             name=f"TPU {label} cost {service.display_meter_number}",
             source=DOMAIN,
-            statistic_id=cost_statistic_id,
+            statistic_id=f"{self._statistic_id(service, stat_type)}_cost",
             unit_class=None,
-            unit_of_measurement=self.hass.config.currency,
+            unit_of_measurement=BILLING_CURRENCY,
         )
-        async_add_external_statistics(self.hass, metadata, statistics)
 
     @staticmethod
     def _statistic_id(service: Service, stat_type: str) -> str:
@@ -757,11 +842,14 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_import_history(
         self, start_date: date | None = None
     ) -> dict[str, Any]:
-        """Replace usage statistics with all history TPU returns.
+        """Merge all history TPU returns into the usage statistics.
 
-        Fetches every configured meter before touching the recorder, so a
-        failed request leaves existing statistics untouched. Cost statistics
-        are cleared and rebuilt by the refresh that follows.
+        Days TPU returns take its values; days it doesn't (older than its
+        history, or before start_date) are kept. Fetches every configured
+        meter before touching the recorder, so a failed request leaves
+        existing statistics untouched. Costs are kept; the refresh that
+        follows reprices them, merging with existing costs for any day it
+        can't reprice.
         """
         services = [
             (service, stat_type, key)
@@ -792,10 +880,17 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._save_token_data()
             except AuthError as err:
                 raise HomeAssistantError(f"MyTPU authentication failed: {err}") from err
-            except (ServerError, MyTPUError, TimeoutError) as err:
+            except (ServerError, MyTPUError, TimeoutError, aiohttp.ClientError) as err:
                 raise HomeAssistantError(
                     f"Fetching history from MyTPU failed: {err}"
                 ) from err
+
+            # Record that every meter needs repricing before rewriting anything,
+            # so a failure or reload partway through still leads to a rebuild
+            await self._async_load_billing()
+            self._needs_reprice = {key for _, _, key, _ in fetched}
+            self._force_cost_rebuild = True
+            await self._async_save_billing()
 
             result: dict[str, Any] = {}
             for service, stat_type, key, readings in fetched:
@@ -805,7 +900,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                     result[key] = {"days": 0}
                     continue
-                await self._rewrite_statistics(service, stat_type, readings)
+                await self._merge_usage(service, stat_type, readings)
                 result[key] = {
                     "days": len(readings),
                     "first_day": dt_util.as_local(readings[0].date).date().isoformat(),
@@ -819,14 +914,20 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     result[key]["last_day"],
                 )
 
-        # Rebuild costs and refresh sensors from the rewritten statistics
+        # Reprice costs from bills and refresh sensors from the rewritten series
         await self.async_request_refresh()
         return result
 
     async def _fetch_history(
         self, service: Service, start_date: date | None
     ) -> list[UsageReading]:
-        """Fetch readings backward in chunks until TPU returns none."""
+        """Fetch readings backward in chunks until TPU returns none.
+
+        TPU only attaches a row's invoiceDate when the invoice falls inside the
+        requested range, so the last days of an older chunk come back without
+        one. Chunks overlap by HISTORY_OVERLAP_DAYS and a copy with an invoice
+        date wins, so every billed day is labeled by the newer request.
+        """
         floor = (
             dt_util.start_of_local_day(start_date) if start_date is not None else None
         )
@@ -841,12 +942,15 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             if not readings:
                 break
-            # Chunk boundaries overlap by a day; keep the first copy seen
             for reading in readings:
-                by_date.setdefault(reading.date, reading)
+                seen = by_date.get(reading.date)
+                if seen is None or (
+                    seen.invoice_date is None and reading.invoice_date is not None
+                ):
+                    by_date[reading.date] = reading
             if floor is not None and start <= floor:
                 break
-            end = start
+            end = start + timedelta(days=HISTORY_OVERLAP_DAYS)
         return [
             reading
             for day, reading in sorted(by_date.items())
@@ -863,22 +967,31 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _rewrite_statistics(
         self, service: Service, stat_type: str, readings: list[UsageReading]
     ) -> None:
-        """Replace a meter's usage series and clear its costs, then wait for commit.
+        """Replace a meter's usage series, then wait for the recorder to commit.
 
-        Recorder tasks run in order, so clearing the cost statistic last with
-        on_done fires only after the usage rewrite before it is committed.
         Without the wait, the next update could read the old series. If the
-        wait times out, updates and imports stay blocked until on_done fires.
+        wait times out, updates and imports stay blocked until it commits.
+        Costs are left alone for the following rebuild to reprice.
         """
         statistic_id = self._statistic_id(service, stat_type)
-        recorder = get_instance(self.hass)
-        recorder.async_clear_statistics([statistic_id])
+        get_instance(self.hass).async_clear_statistics([statistic_id])
         await self._import_statistics(service, readings, stat_type)
+        await self._clear_and_wait_for_recorder([], f"{stat_type} history rewrite")
 
+    async def _clear_and_wait_for_recorder(
+        self, statistic_ids: list[str], label: str
+    ) -> None:
+        """Queue a clear of statistic_ids and wait until the recorder runs it.
+
+        Recorder tasks run in order, so on_done fires only after every write
+        queued before it has committed. An empty list clears nothing and only
+        waits. If the wait times out, updates and imports stay blocked until
+        on_done fires.
+        """
         committed = asyncio.Event()
         self._guard.pending_commit = committed
-        recorder.async_clear_statistics(
-            [f"{statistic_id}_cost"],
+        get_instance(self.hass).async_clear_statistics(
+            statistic_ids,
             on_done=lambda: self.hass.loop.call_soon_threadsafe(committed.set),
         )
         try:
@@ -886,8 +999,391 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await committed.wait()
         except TimeoutError as err:
             raise HomeAssistantError(
-                f"The recorder didn't confirm the {stat_type} history rewrite "
-                f"within {HISTORY_COMMIT_TIMEOUT_SECONDS}s; updates are paused "
-                "until it does"
+                f"The recorder didn't confirm the {label} within "
+                f"{HISTORY_COMMIT_TIMEOUT_SECONDS}s; updates are paused until it does"
             ) from err
         self._guard.pending_commit = None
+
+    async def _maybe_rebuild_billed_costs(
+        self,
+        cost_jobs: list[
+            tuple[Service, str, str, list[StatisticData], str | None, bool]
+        ],
+    ) -> set[str]:
+        """Reprice meters' costs from bills when a statement they lack appears.
+
+        Checks billing history at most once per BILLING_CHECK_INTERVAL_HOURS,
+        or right away after a history import. A meter is repriced when its
+        division has a bill newer than the one last applied to it, or when an
+        import left it needing a full reprice; meters that can't be priced
+        from bills are repriced at the estimate instead. Work is marked done
+        only once that meter's costs are written, so anything unfinished is
+        retried at the next check. Returns the stat types whose costs were
+        written; the incremental cost import skips those.
+        """
+        if not cost_jobs:
+            return set()
+        await self._async_load_billing()
+        now = dt_util.utcnow()
+        if (
+            not self._force_cost_rebuild
+            and self._last_billing_check is not None
+            and now - self._last_billing_check
+            < timedelta(hours=BILLING_CHECK_INTERVAL_HOURS)
+        ):
+            return set()
+
+        try:
+            bills = await self.client.get_billing_history(
+                now - timedelta(days=BILLING_HISTORY_DAYS), now
+            )
+            account_services = await self.client.get_services()
+        except (MyTPUError, TimeoutError, aiohttp.ClientError) as err:
+            _LOGGER.warning("Fetching MyTPU billing history failed: %s", err)
+            return set()
+        self._last_billing_check = now
+        self._force_cost_rebuild = False
+
+        # Each meter is compared with the latest bill for its own division
+        pending: list[tuple[tuple, Bill]] = []
+        estimate_only: list[tuple] = []
+        for job in cost_jobs:
+            service, stat_type = job[0], job[1]
+            key = SERVICE_KEYS[stat_type]
+            division = BILLING_DIVISIONS[service.service_type.value]
+            division_bills = [b for b in bills if b.amounts.get(division) is not None]
+            if not division_bills or not self._bills_attributable(
+                service, stat_type, account_services
+            ):
+                if key in self._needs_reprice:
+                    estimate_only.append(job)
+                continue
+            latest = max(division_bills, key=lambda bill: bill.date)
+            if (
+                key in self._needs_reprice
+                or self._applied_bills.get(key) != latest.date.isoformat()
+            ):
+                pending.append((job, latest))
+
+        rebuilt = await self._reprice_at_estimate(estimate_only)
+        if not pending:
+            return rebuilt
+
+        # Re-fetch usage so each day carries the bill that charged for it. Fetch
+        # every meter before writing, so a failure leaves all costs as they were.
+        try:
+            fetched = [
+                (job, latest, await self._fetch_history(job[0], None))
+                for job, latest in pending
+            ]
+        except (MyTPUError, TimeoutError, aiohttp.ClientError) as err:
+            _LOGGER.warning("Fetching usage to price from bills failed: %s", err)
+            self._last_billing_check = None
+            return rebuilt
+
+        # Usage imported earlier in this update is only queued; a correction
+        # rewrite reading the series before it commits would drop those days
+        if any(job[3] for job, _, _ in fetched):
+            await self._clear_and_wait_for_recorder([], "usage import")
+
+        for job, latest, readings in fetched:
+            service, stat_type, statistic_id, new_stats, price_entity, _ = job
+            key = SERVICE_KEYS[stat_type]
+            await self._apply_corrections(service, stat_type, statistic_id, readings)
+
+            division = BILLING_DIVISIONS[service.service_type.value]
+            summaries = summarize_bills(readings, bills, division)
+            self.rates[key] = rate_summary(summaries)
+            invoices = await self._write_billed_costs(
+                service,
+                stat_type,
+                statistic_id,
+                new_stats,
+                readings,
+                summaries,
+                self._estimate_price(stat_type, price_entity),
+            )
+            if invoices is None:
+                _LOGGER.info("No %s usage to price from bills yet", key)
+                continue
+            rebuilt.add(stat_type)
+            self._needs_reprice.discard(key)
+            # Applied only once the latest bill's own days were written (a credit
+            # or zero bill has no rate to wait for); otherwise retry next check
+            if latest.date in invoices or latest.amounts[division] <= 0:
+                self._applied_bills[key] = latest.date.isoformat()
+                _LOGGER.info("Priced %s costs from bills through %s", key, latest.date)
+            else:
+                _LOGGER.info(
+                    "%s usage for the %s bill isn't available yet; will retry",
+                    key,
+                    latest.date,
+                )
+
+        await self._async_save_billing()
+        return rebuilt
+
+    async def _reprice_at_estimate(
+        self,
+        cost_jobs: list[
+            tuple[Service, str, str, list[StatisticData], str | None, bool]
+        ],
+        *,
+        fill_only: bool = False,
+    ) -> set[str]:
+        """Reprice these meters' usage days at the estimate.
+
+        With fill_only, only days without a cost are priced. Returns the stat
+        types whose costs were written; a full reprice also clears the meter's
+        pending reprice.
+        """
+        rebuilt: set[str] = set()
+        for service, stat_type, statistic_id, new_stats, price_entity, _ in cost_jobs:
+            estimate = self._estimate_price(stat_type, price_entity)
+            if estimate is None:
+                continue
+            usage = await self._usage_days(statistic_id, new_stats)
+            readings = [
+                UsageReading(
+                    date=datetime.fromtimestamp(day, tz=UTC),
+                    consumption=consumption,
+                    unit="",
+                )
+                for day, consumption in sorted(usage.items())
+            ]
+            written = await self._write_billed_costs(
+                service,
+                stat_type,
+                statistic_id,
+                new_stats,
+                readings,
+                {},
+                estimate,
+                fill_only=fill_only,
+            )
+            if written is not None:
+                rebuilt.add(stat_type)
+                if not fill_only:
+                    self._needs_reprice.discard(SERVICE_KEYS[stat_type])
+        if rebuilt:
+            await self._async_save_billing()
+        return rebuilt
+
+    async def _apply_corrections(
+        self,
+        service: Service,
+        stat_type: str,
+        statistic_id: str,
+        readings: list[UsageReading],
+    ) -> None:
+        """Update stored usage days whose TPU reading has since changed.
+
+        TPU can replace an estimated reading with a confirmed one. Only days
+        already in the usage series are compared and updated, so usage and
+        costs keep describing the same consumption.
+        """
+        usage = await self._usage_days(statistic_id, [])
+        stored = [r for r in readings if r.date.timestamp() in usage]
+        corrected = [
+            r
+            for r in stored
+            if abs(usage[r.date.timestamp()] - r.consumption) > USAGE_TOLERANCE
+        ]
+        if corrected:
+            _LOGGER.info(
+                "Updating %s %s readings that MyTPU has corrected",
+                len(corrected),
+                SERVICE_KEYS[stat_type],
+            )
+            await self._merge_usage(service, stat_type, stored)
+
+    async def _usage_days(
+        self, statistic_id: str, new_stats: list[StatisticData]
+    ) -> dict[float, float]:
+        """Return each usage day's consumption by start timestamp.
+
+        Includes rows queued this update, which may not be committed yet, and
+        leaves out the synthetic zero row the series opens with the day before
+        its first reading. Real zero-usage days come later and are kept.
+        """
+        usage = await self.hass.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime(1970, 1, 1, tzinfo=UTC),
+            None,
+            {statistic_id},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+        rows = {
+            float(row["start"]): (float(row.get("state") or 0.0), row.get("sum"))
+            for row in usage.get(statistic_id, [])
+        }
+        rows.update(
+            (row["start"].timestamp(), (float(row.get("state") or 0.0), row.get("sum")))
+            for row in new_stats
+        )
+        days = sorted(rows)
+        if days and rows[days[0]] in ((0.0, 0.0), (0.0, None)):
+            del rows[days[0]]
+        return {day: state for day, (state, _) in rows.items()}
+
+    async def _merge_usage(
+        self, service: Service, stat_type: str, readings: list[UsageReading]
+    ) -> None:
+        """Rewrite the usage series with these readings merged into it.
+
+        Readings replace stored days with the same date; other stored days
+        are kept. Running totals are recalculated from the first day.
+        """
+        statistic_id = self._statistic_id(service, stat_type)
+        merged = {
+            day: UsageReading(
+                date=datetime.fromtimestamp(day, tz=UTC),
+                consumption=consumption,
+                unit="",
+            )
+            for day, consumption in (await self._usage_days(statistic_id, [])).items()
+        }
+        merged.update((reading.date.timestamp(), reading) for reading in readings)
+        await self._rewrite_statistics(
+            service, stat_type, [merged[day] for day in sorted(merged)]
+        )
+
+    def _bills_attributable(
+        self, service: Service, stat_type: str, account_services: list[Service]
+    ) -> bool:
+        """Return True if this meter's bill amounts are its own.
+
+        Bills give one amount per division, so with two meters of the same
+        type on the account they can't be split between them; those costs
+        stay on the estimate.
+        """
+        same_type = [
+            s for s in account_services if s.service_type == service.service_type
+        ]
+        if len(same_type) <= 1:
+            return True
+        key = SERVICE_KEYS[stat_type]
+        if key not in self._warned_shared_meters:
+            self._warned_shared_meters.add(key)
+            _LOGGER.warning(
+                "The account has %s %s meters and bills don't say how much each "
+                "was charged, so %s costs use the estimate instead of bills",
+                len(same_type),
+                key,
+                key,
+            )
+        return False
+
+    async def _async_load_billing(self) -> None:
+        """Load applied bills and bill rates saved by a previous run."""
+        if self._billing_loaded:
+            return
+        stored = await self._billing_store.async_load() or {}
+        self._applied_bills = stored.get("applied") or {}
+        self._needs_reprice = set(stored.get("needs_reprice") or [])
+        self._unpriced = set(stored.get("unpriced") or [])
+        self.rates = stored.get("rates") or {}
+        self._billing_loaded = True
+
+    async def _async_save_billing(self) -> None:
+        """Save applied bills and bill rates."""
+        await self._billing_store.async_save(
+            {
+                "applied": self._applied_bills,
+                "needs_reprice": sorted(self._needs_reprice),
+                "unpriced": sorted(self._unpriced),
+                "rates": self.rates,
+            }
+        )
+
+    async def _write_billed_costs(
+        self,
+        service: Service,
+        stat_type: str,
+        statistic_id: str,
+        new_stats: list[StatisticData],
+        readings: list[UsageReading],
+        summaries: dict[date, BillUsage],
+        estimate: float | None,
+        *,
+        fill_only: bool = False,
+    ) -> set[date] | None:
+        """Reprice a meter's cost series, keeping what can't be repriced.
+
+        Every usage day gets its repriced cost, or else its existing cost
+        (e.g. days older than MyTPU's history, or estimates when no estimate
+        is available now). Days that only have a cost are kept too. With
+        fill_only, existing costs are never replaced. Running totals are
+        recalculated, and whether any usage day is still unpriced is
+        remembered so it can be filled once an estimate exists.
+
+        Returns the invoices whose days were written (unbilled days have none),
+        or None, writing nothing, if no usage day could be priced.
+        """
+        usage = await self._usage_days(statistic_id, new_stats)
+        repriced = {
+            start.timestamp(): (cost, invoice)
+            for start, cost, invoice in daily_costs(readings, summaries, estimate)
+            if start.timestamp() in usage
+        }
+
+        metadata = self._cost_metadata(service, stat_type)
+        cost_id = metadata["statistic_id"]
+        existing = await self.hass.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime(1970, 1, 1, tzinfo=UTC),
+            None,
+            {cost_id},
+            "hour",
+            None,
+            {"state"},
+        )
+        previous = {
+            float(row["start"]): float(row.get("state") or 0.0)
+            for row in existing.get(cost_id, [])
+        }
+        # Like usage, the cost series opens with a synthetic zero row
+        if previous and previous[min(previous)] == 0.0:
+            del previous[min(previous)]
+
+        if fill_only:
+            repriced = {day: v for day, v in repriced.items() if day not in previous}
+        if not repriced:
+            return None
+
+        priced: list[tuple[float, float]] = []
+        for day in sorted(set(usage) | set(previous)):
+            if day in repriced:
+                priced.append((day, repriced[day][0]))
+            elif day in previous:
+                priced.append((day, previous[day]))
+
+        key = SERVICE_KEYS[stat_type]
+        if any(day not in repriced and day not in previous for day in usage):
+            self._unpriced.add(key)
+        else:
+            self._unpriced.discard(key)
+
+        first = datetime.fromtimestamp(priced[0][0], tz=UTC)
+        statistics = [
+            StatisticData(start=first - timedelta(days=1), state=0.0, sum=0.0)
+        ]
+        cost_sum = 0.0
+        for day, cost in priced:
+            cost_sum += cost
+            statistics.append(
+                StatisticData(
+                    start=datetime.fromtimestamp(day, tz=UTC),
+                    state=cost,
+                    sum=round(cost_sum, 4),
+                )
+            )
+
+        get_instance(self.hass).async_clear_statistics([cost_id])
+        async_add_external_statistics(self.hass, metadata, statistics)
+        await self._clear_and_wait_for_recorder([], f"{stat_type} cost rebuild")
+        return {invoice for _, invoice in repriced.values() if invoice is not None}

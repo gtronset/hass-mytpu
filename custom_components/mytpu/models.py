@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 
 from homeassistant.util import dt as dt_util
@@ -25,6 +25,9 @@ class UsageReading:
     high_temp: float | None = None
     low_temp: float | None = None
     demand_peak_time: datetime | None = None
+    # The bill that charged for this day, and the usage that bill charged for
+    invoice_date: date | None = None
+    billed_consumption: float | None = None
 
     @classmethod
     def from_api_response(cls, data: dict) -> "UsageReading":
@@ -42,6 +45,15 @@ class UsageReading:
         )
         utc_date = dt_util.as_utc(local_midnight)
 
+        invoice_date = None
+        if data.get("invoiceDate"):
+            with contextlib.suppress(ValueError, TypeError):
+                invoice_date = datetime.strptime(data["invoiceDate"], "%Y-%m-%d").date()
+        billed_consumption = None
+        if data.get("billedConsumption") not in (None, ""):
+            with contextlib.suppress(ValueError, TypeError):
+                billed_consumption = float(data["billedConsumption"])
+
         return cls(
             date=utc_date,
             consumption=data.get("usageConsumptionValue", 0.0),
@@ -49,7 +61,17 @@ class UsageReading:
             high_temp=data.get("usageHighTemp"),
             low_temp=data.get("usageLowTemp"),
             demand_peak_time=peak_time,
+            invoice_date=invoice_date,
+            billed_consumption=billed_consumption,
         )
+
+
+@dataclass
+class Bill:
+    """A billing statement's charges, keyed by service division."""
+
+    date: date
+    amounts: dict[str, float]
 
 
 @dataclass
