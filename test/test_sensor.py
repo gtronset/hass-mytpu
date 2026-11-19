@@ -281,7 +281,7 @@ class TestTPURateSensor:
 
     def _sensor(self, mock_config_entry, rates, service="water"):
         coordinator = MagicMock()
-        coordinator.hass.config.currency = "USD"
+        coordinator.hass.config.currency = "EUR"  # rates stay in the bills' USD
         coordinator.rates = rates
         return TPURateSensor(
             coordinator,

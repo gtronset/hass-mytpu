@@ -25,6 +25,9 @@ ATTR_START_DATE = "start_date"
 
 # History import fetches backward in chunks until TPU returns no readings
 HISTORY_CHUNK_DAYS = 365
+# Chunks overlap by this much, covering the gap between a bill's last day and
+# its invoice date even for every-other-month bills
+HISTORY_OVERLAP_DAYS = 75
 MAX_HISTORY_CHUNKS = 10
 # How long to wait for the recorder to commit a history rewrite
 HISTORY_COMMIT_TIMEOUT_SECONDS = 300
@@ -38,6 +41,8 @@ BILLING_CATEGORIES = [
     "Surface Water",
     "AdjDepFee",
 ]
+# Currency MyTPU bills are in
+BILLING_CURRENCY = "USD"
 # Billing division that charges for each meter's usage, by service type
 BILLING_DIVISIONS = {"P": "Power", "W": "Water"}
 # How often to check for new bills, and how far back to request them

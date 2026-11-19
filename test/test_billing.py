@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 from aioresponses import aioresponses
 from homeassistant.core import HomeAssistant
@@ -256,6 +257,8 @@ def _coordinator(hass, entry):
     coordinator._billing_store = MagicMock()
     coordinator._billing_store.async_load = AsyncMock(return_value=None)
     coordinator._billing_store.async_save = AsyncMock()
+    services = [s for s in (coordinator.power_service, coordinator.water_service) if s]
+    coordinator.client.get_services = AsyncMock(return_value=services)
     return coordinator
 
 
@@ -270,13 +273,42 @@ def _job(coordinator, price_entity=None):
     )
 
 
+def _period(rows_by_id):
+    """statistics_during_period stand-in returning rows for the requested id."""
+
+    def lookup(hass, start, end, statistic_ids, *args):
+        (statistic_id,) = statistic_ids
+        return {statistic_id: rows_by_id.get(statistic_id, [])}
+
+    return lookup
+
+
+def _usage_rows(readings, baseline=True):
+    """Usage statistic rows as the recorder returns them, with the zero baseline."""
+    rows = []
+    if baseline:
+        start = readings[0].date - timedelta(days=1)
+        rows.append({"start": start.timestamp(), "state": 0.0, "sum": 0.0})
+    total = 0.0
+    for reading in readings:
+        total += reading.consumption
+        rows.append(
+            {
+                "start": reading.date.timestamp(),
+                "state": reading.consumption,
+                "sum": total,
+            }
+        )
+    return rows
+
+
 class TestRebuildBilledCosts:
     """TPUDataUpdateCoordinator._maybe_rebuild_billed_costs."""
 
     async def test_new_bill_rebuilds_costs(
         self, hass: HomeAssistant, make_config_entry
     ):
-        """A new statement rewrites the cost series from bills and is remembered."""
+        """A new statement reprices the meter, in USD, and is remembered per meter."""
         coordinator = _coordinator(hass, make_config_entry(include_power=True))
         readings = [
             _reading(1, 10.0, NOV_3, billed=20.0),
@@ -287,28 +319,28 @@ class TestRebuildBilledCosts:
         )
         coordinator._fetch_history = AsyncMock(return_value=readings)
         recorder = _recorder()
-        usage_rows = {ENERGY_ID: [{"start": r.date.timestamp()} for r in readings]}
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
             patch(
                 "custom_components.mytpu.statistics_during_period",
-                return_value=usage_rows,
+                side_effect=_period({ENERGY_ID: _usage_rows(readings)}),
             ),
             patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
         ):
             rebuilt = await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
 
-        assert rebuilt is True
+        assert rebuilt == {"energy"}
         clears = [c.args[0] for c in recorder.async_clear_statistics.call_args_list]
         assert clears == [[COST_ID], []]  # clear, write, then wait for commit
         metadata, stats = mock_add.call_args.args[1], mock_add.call_args.args[2]
         assert metadata["statistic_id"] == COST_ID
+        assert metadata["unit_of_measurement"] == "USD"
         assert [s["state"] for s in stats] == [0.0, 2.0, 2.0]
         assert [s["sum"] for s in stats] == [0.0, 2.0, 4.0]
         coordinator._billing_store.async_save.assert_awaited_once_with(
             {
-                "applied_bill": "2026-11-03",
+                "applied": {"power": "2026-11-03"},
                 "rates": {
                     "power": {
                         "rate": 0.2,
@@ -319,23 +351,125 @@ class TestRebuildBilledCosts:
                 },
             }
         )
-        assert coordinator.rates["power"]["rate"] == 0.2
+
+    async def test_rebuild_keeps_costs_it_cannot_reprice(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """Days MyTPU no longer returns keep their costs; totals are recalculated."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        old = _reading(1, 10.0)  # in the usage series, but not fetched again
+        billed = _reading(2, 10.0, NOV_3, billed=10.0)
+        coordinator.client.get_billing_history = AsyncMock(
+            return_value=[Bill(date=NOV_3, amounts={"Power": 3.0})]
+        )
+        coordinator._fetch_history = AsyncMock(return_value=[billed])
+        old_costs = [
+            {"start": (old.date - timedelta(days=1)).timestamp(), "state": 0.0},
+            {"start": old.date.timestamp(), "state": 1.5},
+            {"start": billed.date.timestamp(), "state": 9.0},  # stale estimate
+        ]
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=_recorder()),
+            patch(
+                "custom_components.mytpu.statistics_during_period",
+                side_effect=_period(
+                    {ENERGY_ID: _usage_rows([old, billed]), COST_ID: old_costs}
+                ),
+            ),
+            patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
+        ):
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+
+        stats = mock_add.call_args.args[2]
+        assert [s["start"] for s in stats[1:]] == [old.date, billed.date]
+        assert [s["state"] for s in stats] == [0.0, 1.5, 3.0]
+        assert [s["sum"] for s in stats] == [0.0, 1.5, 4.5]
+
+    async def test_baseline_day_is_not_priced(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """The usage series' zero baseline isn't a usage day, even if TPU has it."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        before = _reading(1, 10.0, NOV_3, billed=20.0)  # the baseline's day
+        first = _reading(2, 10.0, NOV_3, billed=20.0)
+        coordinator.client.get_billing_history = AsyncMock(
+            return_value=[Bill(date=NOV_3, amounts={"Power": 4.0})]
+        )
+        coordinator._fetch_history = AsyncMock(return_value=[before, first])
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=_recorder()),
+            patch(
+                "custom_components.mytpu.statistics_during_period",
+                side_effect=_period({ENERGY_ID: _usage_rows([first])}),
+            ),
+            patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
+        ):
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+
+        stats = mock_add.call_args.args[2]
+        assert [s["start"] for s in stats[1:]] == [first.date]
+
+    async def test_meter_with_nothing_to_price_is_retried(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """A meter whose costs weren't written isn't marked applied."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        coordinator.client.get_billing_history = AsyncMock(
+            return_value=[Bill(date=NOV_3, amounts={"Power": 4.0})]
+        )
+        coordinator._fetch_history = AsyncMock(return_value=[])
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=_recorder()),
+            patch(
+                "custom_components.mytpu.statistics_during_period",
+                side_effect=_period({}),
+            ),
+        ):
+            rebuilt = await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+
+        assert rebuilt == set()
+        assert coordinator._applied_bills == {}
 
     async def test_same_bill_skips_rebuild(
         self, hass: HomeAssistant, make_config_entry
     ):
-        """A statement that was already applied doesn't trigger a rebuild."""
+        """A statement already applied to the meter doesn't trigger a rebuild."""
         coordinator = _coordinator(hass, make_config_entry(include_power=True))
         coordinator._billing_store.async_load = AsyncMock(
-            return_value={"applied_bill": "2026-11-03"}
+            return_value={"applied": {"power": "2026-11-03"}}
         )
         coordinator.client.get_billing_history = AsyncMock(
             return_value=[Bill(date=NOV_3, amounts={"Power": 4.0})]
         )
         coordinator._fetch_history = AsyncMock()
 
-        assert not await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+        assert (
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == set()
+        )
         coordinator._fetch_history.assert_not_awaited()
+
+    async def test_shared_meter_type_uses_estimate(
+        self, hass: HomeAssistant, make_config_entry, caplog
+    ):
+        """With two meters of a type, bills can't be split, so they aren't used."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        other = MagicMock(service_type=coordinator.power_service.service_type)
+        coordinator.client.get_services = AsyncMock(
+            return_value=[coordinator.power_service, other]
+        )
+        coordinator.client.get_billing_history = AsyncMock(
+            return_value=[Bill(date=NOV_3, amounts={"Power": 4.0})]
+        )
+        coordinator._fetch_history = AsyncMock()
+
+        assert (
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == set()
+        )
+        coordinator._fetch_history.assert_not_awaited()
+        assert "2 power meters" in caplog.text
 
     async def test_checks_at_most_daily(self, hass: HomeAssistant, make_config_entry):
         """Billing isn't requested again within the check interval."""
@@ -345,52 +479,58 @@ class TestRebuildBilledCosts:
             hours=BILLING_CHECK_INTERVAL_HOURS - 1
         )
 
-        assert not await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+        assert (
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == set()
+        )
         coordinator.client.get_billing_history.assert_not_awaited()
 
-    async def test_forced_rebuild_ignores_interval_and_applied_bill(
+    async def test_forced_rebuild_ignores_interval(
         self, hass: HomeAssistant, make_config_entry
     ):
-        """After a history import, costs are rebuilt even for the same bill."""
+        """After a history import, billing is checked even within the interval."""
         coordinator = _coordinator(hass, make_config_entry(include_power=True))
-        coordinator._billing_store.async_load = AsyncMock(
-            return_value={"applied_bill": "2026-11-03"}
-        )
         coordinator._last_billing_check = dt_util.utcnow()
         coordinator._force_cost_rebuild = True
         coordinator.client.get_billing_history = AsyncMock(
             return_value=[Bill(date=NOV_3, amounts={"Power": 4.0})]
         )
         coordinator._fetch_history = AsyncMock(return_value=[])
-        coordinator._write_billed_costs = AsyncMock()
+        coordinator._write_billed_costs = AsyncMock(return_value=True)
 
-        assert await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
-        coordinator._write_billed_costs.assert_awaited_once()
+        assert await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == {
+            "energy"
+        }
         assert coordinator._force_cost_rebuild is False
 
+    @pytest.mark.parametrize(
+        "error", [MyTPUError("boom"), aiohttp.ClientConnectionError("reset")]
+    )
     async def test_billing_failure_retries_next_update(
-        self, hass: HomeAssistant, make_config_entry
+        self, hass: HomeAssistant, make_config_entry, error
     ):
-        """A failed billing request returns False and is retried next update."""
+        """A failed billing request, including network errors, is retried next update."""
         coordinator = _coordinator(hass, make_config_entry(include_power=True))
-        coordinator.client.get_billing_history = AsyncMock(
-            side_effect=MyTPUError("boom")
-        )
+        coordinator.client.get_billing_history = AsyncMock(side_effect=error)
 
-        assert not await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+        assert (
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == set()
+        )
         assert coordinator._last_billing_check is None
 
-    async def test_usage_failure_writes_nothing(
-        self, hass: HomeAssistant, make_config_entry
+    @pytest.mark.parametrize(
+        "error", [MyTPUError("boom"), aiohttp.ClientConnectionError("reset")]
+    )
+    async def test_usage_failure_writes_nothing_and_retries(
+        self, hass: HomeAssistant, make_config_entry, error
     ):
-        """If re-fetching usage fails, no meter's costs are touched."""
+        """If re-fetching usage fails, no meter changes and the next update retries."""
         coordinator = _coordinator(
             hass, make_config_entry(include_power=True, include_water=True)
         )
         coordinator.client.get_billing_history = AsyncMock(
             return_value=[Bill(date=NOV_3, amounts={"Power": 4.0})]
         )
-        coordinator._fetch_history = AsyncMock(side_effect=[[], MyTPUError("boom")])
+        coordinator._fetch_history = AsyncMock(side_effect=[[], error])
         coordinator._write_billed_costs = AsyncMock()
         water_job = (
             coordinator.water_service,
@@ -401,11 +541,15 @@ class TestRebuildBilledCosts:
             False,
         )
 
-        assert not await coordinator._maybe_rebuild_billed_costs(
-            [_job(coordinator), water_job]
+        assert (
+            await coordinator._maybe_rebuild_billed_costs(
+                [_job(coordinator), water_job]
+            )
+            == set()
         )
         coordinator._write_billed_costs.assert_not_awaited()
         coordinator._billing_store.async_save.assert_not_awaited()
+        assert coordinator._last_billing_check is None
 
     async def test_no_bills_clears_forced_rebuild(
         self, hass: HomeAssistant, make_config_entry
@@ -415,41 +559,54 @@ class TestRebuildBilledCosts:
         coordinator._force_cost_rebuild = True
         coordinator.client.get_billing_history = AsyncMock(return_value=[])
 
-        assert not await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+        assert (
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == set()
+        )
         assert coordinator._force_cost_rebuild is False
 
-    async def test_update_skips_incremental_cost_after_rebuild(
+    async def test_update_skips_incremental_cost_only_for_rebuilt_meters(
         self, hass: HomeAssistant, make_config_entry
     ):
-        """When bills rebuilt the costs, the price-entity import doesn't run."""
-        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        """Meters rebuilt from bills skip the estimate import; others still run it."""
+        coordinator = _coordinator(
+            hass, make_config_entry(include_power=True, include_water=True)
+        )
         coordinator.client.get_token_data = lambda: None
         coordinator.client.get_usage = AsyncMock(return_value=[])
-        coordinator._maybe_rebuild_billed_costs = AsyncMock(return_value=True)
+        coordinator._maybe_rebuild_billed_costs = AsyncMock(return_value={"energy"})
         coordinator._import_cost_statistics = AsyncMock()
 
         with patch("custom_components.mytpu.get_last_statistics", return_value={}):
             await coordinator._do_fetch()
 
-        coordinator._maybe_rebuild_billed_costs.assert_awaited_once()
-        coordinator._import_cost_statistics.assert_not_awaited()
+        stat_types = [
+            c.args[1] for c in coordinator._import_cost_statistics.await_args_list
+        ]
+        assert stat_types == ["water"]
 
-    async def test_import_history_forces_rebuild(
+    async def test_import_history_marks_rebuild_before_rewriting(
         self, hass: HomeAssistant, make_config_entry
     ):
-        """import_history asks the refresh that follows to rebuild from bills."""
+        """The rebuild is recorded as needed before any usage is rewritten."""
         coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        coordinator._billing_store.async_load = AsyncMock(
+            return_value={"applied": {"power": "2026-11-03"}}
+        )
         coordinator.client.get_token_data = lambda: None
         coordinator._fetch_history = AsyncMock(return_value=[_reading(1)])
-        coordinator._rewrite_statistics = AsyncMock()
+        order: list[str] = []
+        coordinator._billing_store.async_save = AsyncMock(
+            side_effect=lambda data: order.append(f"save {data['applied']}")
+        )
+        coordinator._rewrite_statistics = AsyncMock(
+            side_effect=lambda *args: order.append("rewrite")
+        )
         coordinator.async_request_refresh = AsyncMock()
 
         await coordinator.async_import_history()
 
+        assert order == ["save {}", "rewrite"]
         assert coordinator._force_cost_rebuild is True
-        coordinator._billing_store.async_save.assert_awaited_once_with(
-            {"applied_bill": None, "rates": {}}
-        )
         coordinator.async_request_refresh.assert_awaited_once()
 
 

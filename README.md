@@ -79,8 +79,8 @@ a day or more behind, so recent days fill in later.
 
 Home Assistant can't apply a price entity or a static price to external
 statistics, so the integration imports cost statistics itself:
-`mytpu:p_<meter>_energy_cost` and `mytpu:w_<meter>_water_cost`, in your Home
-Assistant currency.
+`mytpu:p_<meter>_energy_cost` and `mytpu:w_<meter>_water_cost`, in US dollars
+like your bills (a price entity should be in USD too).
 
 **Billed days come from your actual MyTPU bills.** Once a day the integration
 checks your billing history. When a new statement appears, it rebuilds the cost
@@ -95,6 +95,11 @@ rate increase, pick an entity holding your price (an `input_number` or a
 template sensor, per kWh or per CCF) as the power and/or water price entity in
 the integration's **Configure** dialog. When the next bill arrives, it replaces
 the estimates for its days.
+
+Each new bill reprices every day MyTPU still returns. Days it no longer returns
+(older than about two years) keep the costs they already had. If the account
+has two meters of the same type, bills can't be split between them, so that
+type's costs use the estimate.
 
 Bills are checked against their daily usage. A bill whose daily usage exceeds
 what it billed (e.g. after a corrected meter read) has its amount shared across

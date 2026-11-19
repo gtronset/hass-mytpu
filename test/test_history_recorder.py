@@ -74,10 +74,11 @@ async def test_rewrite_committed_before_return(hass: HomeAssistant, make_config_
         get_last_statistics, hass, 1, ENERGY_ID, True, {"sum"}
     )
     assert last[ENERGY_ID][0]["sum"] == 3.0
+    # Costs are kept for the following rebuild to reprice
     cost = await hass.async_add_executor_job(
         get_last_statistics, hass, 1, f"{ENERGY_ID}_cost", True, {"sum"}
     )
-    assert cost == {}
+    assert cost[f"{ENERGY_ID}_cost"][0]["sum"] == 50.0
 
 
 async def test_billed_cost_rebuild_committed_before_return(
@@ -104,9 +105,10 @@ async def test_billed_cost_rebuild_committed_before_return(
     coordinator.client.get_billing_history = AsyncMock(
         return_value=[Bill(date=invoice, amounts={"Power": 5.0})]
     )
+    coordinator.client.get_services = AsyncMock(return_value=[service])
     coordinator._fetch_history = AsyncMock(return_value=readings)
     job = (service, "energy", ENERGY_ID, [], None, False)
-    assert await coordinator._maybe_rebuild_billed_costs([job])
+    assert await coordinator._maybe_rebuild_billed_costs([job]) == {"energy"}
 
     # No extra wait: the rebuild must not return before the recorder commits
     cost = await hass.async_add_executor_job(

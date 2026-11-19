@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 from . import TPUDataUpdateCoordinator
 from .const import (
+    BILLING_CURRENCY,
     CONF_POWER_SERVICE,
     CONF_WATER_SERVICE,
     DOMAIN,
@@ -182,9 +183,8 @@ class TPURateSensor(TPUSensor):
         """Initialize the sensor."""
         super().__init__(coordinator, entry, unique_id_suffix, service_type)
         self._attr_translation_key = translation_key
-        self._attr_native_unit_of_measurement = (
-            f"{coordinator.hass.config.currency}/{unit}"
-        )
+        # Bills are in US dollars whatever Home Assistant's currency is
+        self._attr_native_unit_of_measurement = f"{BILLING_CURRENCY}/{unit}"
 
     @property
     def native_value(self) -> float | None:

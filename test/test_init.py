@@ -34,7 +34,7 @@ def no_billed_cost_rebuild():
     with patch.object(
         TPUDataUpdateCoordinator,
         "_maybe_rebuild_billed_costs",
-        new=AsyncMock(return_value=False),
+        new=AsyncMock(return_value=set()),
     ):
         yield
 
