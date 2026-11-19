@@ -158,7 +158,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await client.close()
         raise
 
-    hass.data[DOMAIN][entry.entry_id] = {"coordinator": coordinator}
+    hass.data[DOMAIN][entry.entry_id] = {
+        "coordinator": coordinator,
+        # Options this setup used, to tell option changes from saved tokens
+        "options": dict(entry.options),
+    }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -168,7 +172,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
+    """Reload when options change.
+
+    Update listeners also fire when entry data changes, which happens every
+    time refreshed tokens are saved; those don't need a reload.
+    """
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if entry_data is not None and entry_data.get("options") == dict(entry.options):
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
