@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
-    from homeassistant.core import HomeAssistant
+    from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse
+    from homeassistant.helpers.typing import ConfigType
 
+import voluptuous as vol
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -23,6 +27,7 @@ from homeassistant.components.recorder.statistics import (
     statistics_during_period,
 )
 from homeassistant.components.recorder.util import get_instance
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_USERNAME,
@@ -30,13 +35,22 @@ from homeassistant.const import (
     UnitOfEnergy,
     UnitOfVolume,
 )
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.core import SupportsResponse
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    HomeAssistantError,
+    ServiceValidationError,
+)
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .auth import AuthError, MyTPUAuth, ServerError
 from .client import MyTPUClient, MyTPUError
 from .const import (
+    ATTR_CONFIG_ENTRY_ID,
+    ATTR_START_DATE,
     CONF_POWER_PRICE_ENTITY,
     CONF_POWER_SERVICE,
     CONF_TOKEN_DATA,
@@ -45,13 +59,26 @@ from .const import (
     CONF_WATER_SERVICE,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
+    HISTORY_CHUNK_DAYS,
+    HISTORY_COMMIT_TIMEOUT_SECONDS,
+    MAX_HISTORY_CHUNKS,
     MIN_UPDATE_INTERVAL_HOURS,
+    SERVICE_IMPORT_HISTORY,
 )
-from .models import Service, ServiceType
+from .models import Service, ServiceType, UsageReading
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+IMPORT_HISTORY_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_CONFIG_ENTRY_ID): cv.string,
+        vol.Optional(ATTR_START_DATE): cv.date,
+    }
+)
 
 
 def _service_from_config(config_json: str) -> Service:
@@ -70,6 +97,53 @@ def _service_from_config(config_json: str) -> Service:
     )
 
 
+@dataclass
+class _StatisticsGuard:
+    """Per-entry write state that must outlive a coordinator across reloads."""
+
+    # Keeps scheduled updates and history imports from interleaving writes
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Set by a statistics rewrite whose recorder commit hasn't been confirmed
+    pending_commit: asyncio.Event | None = None
+
+
+def _statistics_guard(hass: HomeAssistant, entry_id: str) -> _StatisticsGuard:
+    """Return the entry's guard, shared by every coordinator created for it."""
+    guards: dict[str, _StatisticsGuard] = hass.data.setdefault(f"{DOMAIN}_guards", {})
+    return guards.setdefault(entry_id, _StatisticsGuard())
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the integration's actions."""
+
+    async def _async_import_history(call: ServiceCall) -> ServiceResponse:
+        entry_id = call.data[ATTR_CONFIG_ENTRY_ID]
+        entry = hass.config_entries.async_get_entry(entry_id)
+        if (
+            entry is None
+            or entry.domain != DOMAIN
+            or entry.state is not ConfigEntryState.LOADED
+        ):
+            raise ServiceValidationError(
+                f"{entry_id} is not a loaded Tacoma Public Utilities entry"
+            )
+        coordinator: TPUDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
+            "coordinator"
+        ]
+        return await coordinator.async_import_history(call.data.get(ATTR_START_DATE))
+
+    # Admin-only: the import replaces the account's usage and cost statistics
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_IMPORT_HISTORY,
+        _async_import_history,
+        schema=IMPORT_HISTORY_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tacoma Public Utilities from a config entry."""
     hass.data.setdefault(DOMAIN, {})
@@ -84,7 +158,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await client.close()
         raise
 
-    hass.data[DOMAIN][entry.entry_id] = {"coordinator": coordinator}
+    hass.data[DOMAIN][entry.entry_id] = {
+        "coordinator": coordinator,
+        # Options this setup used, to tell option changes from saved tokens
+        "options": dict(entry.options),
+    }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -94,7 +172,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
+    """Reload when options change.
+
+    Update listeners also fire when entry data changes, which happens every
+    time refreshed tokens are saved; those don't need a reload.
+    """
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if entry_data is not None and entry_data.get("options") == dict(entry.options):
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -134,6 +219,9 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.client = client
         self.config_entry = config_entry
+        # Shared with any coordinator that replaces this one on reload, so a
+        # rewrite still awaiting the recorder keeps blocking the new one too
+        self._guard = _statistics_guard(hass, config_entry.entry_id)
 
         # Parse service configs from JSON
         self.power_service: Service | None = None
@@ -149,17 +237,22 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data, re-logging in automatically if token refresh fails."""
-        try:
-            return await self._do_fetch()
-        except ServerError as err:
-            await self._relogin_or_raise(err)
-            # Re-login succeeded — retry once with the fresh token
+        async with self._guard.lock:
+            if self._history_commit_pending():
+                # Reading statistics now could continue the old running totals
+                _LOGGER.debug("Skipping update until the history rewrite commits")
+                return self.data or {}
             try:
                 return await self._do_fetch()
-            except ServerError as retry_err:
-                raise UpdateFailed(
-                    f"MyTPU server error after re-login: {retry_err}"
-                ) from retry_err
+            except ServerError as err:
+                await self._relogin_or_raise(err)
+                # Re-login succeeded — retry once with the fresh token
+                try:
+                    return await self._do_fetch()
+                except ServerError as retry_err:
+                    raise UpdateFailed(
+                        f"MyTPU server error after re-login: {retry_err}"
+                    ) from retry_err
 
     async def _do_fetch(self) -> dict[str, Any]:
         """Fetch data from TPU. Raises ServerError on token refresh failure."""
@@ -652,3 +745,149 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             unit_of_measurement=self.hass.config.currency,
         )
         async_add_external_statistics(self.hass, metadata, statistics)
+
+    @staticmethod
+    def _statistic_id(service: Service, stat_type: str) -> str:
+        """Return the usage statistic_id for a service."""
+        meter_id = f"{service.service_type.value}_{service.meter_number}".replace(
+            "-", "_"
+        ).lower()
+        return f"{DOMAIN}:{meter_id}_{stat_type}"
+
+    async def async_import_history(
+        self, start_date: date | None = None
+    ) -> dict[str, Any]:
+        """Replace usage statistics with all history TPU returns.
+
+        Fetches every configured meter before touching the recorder, so a
+        failed request leaves existing statistics untouched. Cost statistics
+        are cleared and rebuilt by the refresh that follows.
+        """
+        services = [
+            (service, stat_type, key)
+            for service, stat_type, key in (
+                (self.power_service, "energy", "power"),
+                (self.water_service, "water", "water"),
+            )
+            if service
+        ]
+
+        async with self._guard.lock:
+            if self._history_commit_pending():
+                raise HomeAssistantError(
+                    "The previous history import hasn't been committed by the "
+                    "recorder yet; try again later"
+                )
+            try:
+                await self.client.get_account_info()
+                fetched = [
+                    (
+                        service,
+                        stat_type,
+                        key,
+                        await self._fetch_history(service, start_date),
+                    )
+                    for service, stat_type, key in services
+                ]
+                await self._save_token_data()
+            except AuthError as err:
+                raise HomeAssistantError(f"MyTPU authentication failed: {err}") from err
+            except (ServerError, MyTPUError, TimeoutError) as err:
+                raise HomeAssistantError(
+                    f"Fetching history from MyTPU failed: {err}"
+                ) from err
+
+            result: dict[str, Any] = {}
+            for service, stat_type, key, readings in fetched:
+                if not readings:
+                    _LOGGER.warning(
+                        "No %s history returned; existing statistics kept", key
+                    )
+                    result[key] = {"days": 0}
+                    continue
+                await self._rewrite_statistics(service, stat_type, readings)
+                result[key] = {
+                    "days": len(readings),
+                    "first_day": dt_util.as_local(readings[0].date).date().isoformat(),
+                    "last_day": dt_util.as_local(readings[-1].date).date().isoformat(),
+                }
+                _LOGGER.info(
+                    "Imported %s days of %s history (%s to %s)",
+                    result[key]["days"],
+                    key,
+                    result[key]["first_day"],
+                    result[key]["last_day"],
+                )
+
+        # Rebuild costs and refresh sensors from the rewritten statistics
+        await self.async_request_refresh()
+        return result
+
+    async def _fetch_history(
+        self, service: Service, start_date: date | None
+    ) -> list[UsageReading]:
+        """Fetch readings backward in chunks until TPU returns none."""
+        floor = (
+            dt_util.start_of_local_day(start_date) if start_date is not None else None
+        )
+        by_date: dict[datetime, UsageReading] = {}
+        end = dt_util.now()
+        for _ in range(MAX_HISTORY_CHUNKS):
+            start = end - timedelta(days=HISTORY_CHUNK_DAYS)
+            if floor is not None and start < floor:
+                start = floor
+            readings = await self.client.get_usage(
+                service, from_date=start, to_date=end
+            )
+            if not readings:
+                break
+            # Chunk boundaries overlap by a day; keep the first copy seen
+            for reading in readings:
+                by_date.setdefault(reading.date, reading)
+            if floor is not None and start <= floor:
+                break
+            end = start
+        return [
+            reading
+            for day, reading in sorted(by_date.items())
+            if floor is None or day >= floor
+        ]
+
+    def _history_commit_pending(self) -> bool:
+        """Return True while a history rewrite awaits recorder confirmation."""
+        guard = self._guard
+        if guard.pending_commit is not None and guard.pending_commit.is_set():
+            guard.pending_commit = None
+        return guard.pending_commit is not None
+
+    async def _rewrite_statistics(
+        self, service: Service, stat_type: str, readings: list[UsageReading]
+    ) -> None:
+        """Replace a meter's usage series and clear its costs, then wait for commit.
+
+        Recorder tasks run in order, so clearing the cost statistic last with
+        on_done fires only after the usage rewrite before it is committed.
+        Without the wait, the next update could read the old series. If the
+        wait times out, updates and imports stay blocked until on_done fires.
+        """
+        statistic_id = self._statistic_id(service, stat_type)
+        recorder = get_instance(self.hass)
+        recorder.async_clear_statistics([statistic_id])
+        await self._import_statistics(service, readings, stat_type)
+
+        committed = asyncio.Event()
+        self._guard.pending_commit = committed
+        recorder.async_clear_statistics(
+            [f"{statistic_id}_cost"],
+            on_done=lambda: self.hass.loop.call_soon_threadsafe(committed.set),
+        )
+        try:
+            async with asyncio.timeout(HISTORY_COMMIT_TIMEOUT_SECONDS):
+                await committed.wait()
+        except TimeoutError as err:
+            raise HomeAssistantError(
+                f"The recorder didn't confirm the {stat_type} history rewrite "
+                f"within {HISTORY_COMMIT_TIMEOUT_SECONDS}s; updates are paused "
+                "until it does"
+            ) from err
+        self._guard.pending_commit = None

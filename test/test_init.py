@@ -78,6 +78,36 @@ async def test_update_listener(hass: HomeAssistant, mock_config_entry):
         mock_reload.assert_called_once_with(mock_config_entry.entry_id)
 
 
+async def test_update_listener_ignores_data_only_changes(
+    hass: HomeAssistant, mock_config_entry
+):
+    """Saving refreshed tokens (a data change) doesn't reload the entry."""
+    hass.data[DOMAIN] = {
+        mock_config_entry.entry_id: {
+            "coordinator": MagicMock(),
+            "options": dict(mock_config_entry.options),
+        }
+    }
+    with patch.object(hass.config_entries, "async_reload") as mock_reload:
+        await update_listener(hass, mock_config_entry)
+    mock_reload.assert_not_called()
+
+
+async def test_update_listener_reloads_on_option_change(
+    hass: HomeAssistant, mock_config_entry
+):
+    """Changed options reload the entry."""
+    hass.data[DOMAIN] = {
+        mock_config_entry.entry_id: {
+            "coordinator": MagicMock(),
+            "options": {"update_interval_hours": 99},
+        }
+    }
+    with patch.object(hass.config_entries, "async_reload") as mock_reload:
+        await update_listener(hass, mock_config_entry)
+    mock_reload.assert_called_once_with(mock_config_entry.entry_id)
+
+
 async def test_async_setup_entry(hass: HomeAssistant, mock_config_entry):
     """Test successful setup of config entry."""
     # Add the config entry to hass before setup

@@ -58,5 +58,21 @@
         }
       }
     }
+  },
+  "services": {
+    "import_history": {
+      "name": "Import history",
+      "description": "Replaces the usage statistics with all history MyTPU still has (about two years), then rebuilds cost statistics at the current price.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Account",
+          "description": "The Tacoma Public Utilities entry to import history for."
+        },
+        "start_date": {
+          "name": "Start date",
+          "description": "Only import from this day on. Leave empty to import everything MyTPU returns."
+        }
+      }
+    }
   }
 }

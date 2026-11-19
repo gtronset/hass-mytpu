@@ -1,0 +1,11 @@
+import_history:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: mytpu
+    start_date:
+      required: false
+      selector:
+        date:
