@@ -8,6 +8,8 @@ CONF_TOKEN_DATA = "token_data"
 
 TPU_POWER_SENSOR_ID_SUFFIX = "_energy"
 TPU_WATER_SENSOR_ID_SUFFIX = "_water"
+TPU_POWER_RATE_ID_SUFFIX = "_energy_rate"
+TPU_WATER_RATE_ID_SUFFIX = "_water_rate"
 
 CONF_UPDATE_INTERVAL_HOURS = "update_interval_hours"
 CONF_POWER_PRICE_ENTITY = "power_price_entity"

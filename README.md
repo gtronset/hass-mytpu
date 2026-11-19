@@ -54,6 +54,12 @@ This integration creates the following sensors:
 | ------------------ | ----------------------- | ---- | ------------ |
 | Energy Consumption | Daily electricity usage | kWh  | energy       |
 | Water Consumption  | Daily water usage       | CCF  | water        |
+| Energy Rate        | Electricity price per kWh from your bills | USD/kWh | |
+| Water Rate         | Drinking water price per CCF from your bills | USD/CCF | |
+
+The rate sensors show the total charged over your last 12 bills divided by the
+usage those bills charged for, including fixed charges and taxes. Attributes
+give the most recent bill's rate and date. They update when a new bill arrives.
 
 Historical data and cumulative totals are tracked using Home Assistant's [statistics](https://www.home-assistant.io/integrations/statistics/) system for proper [Energy Dashboard](https://www.home-assistant.io/docs/energy/) integration.
 
@@ -83,12 +89,17 @@ bill's Electricity or Drinking water amount divided by the usage it charged
 for). Totals per bill match what you were charged, including that service's
 fixed charges and taxes. Wastewater, solid waste and stormwater aren't included.
 
-**Days since the last bill use an estimate.** To price them, create an entity
-holding your current price, e.g. an `input_number` or a template sensor, per
-kWh (power) or per CCF (water), and pick it as the power and/or water price
-entity in the integration's **Configure** dialog. Without one, those days stay
-unpriced until they're billed. When the next bill arrives, it replaces the
-estimates for its days.
+**Days since the last bill use an estimate:** the Energy Rate or Water Rate
+above, so no helpers are needed. To override it, for example after a known
+rate increase, pick an entity holding your price (an `input_number` or a
+template sensor, per kWh or per CCF) as the power and/or water price entity in
+the integration's **Configure** dialog. When the next bill arrives, it replaces
+the estimates for its days.
+
+Bills are checked against their daily usage. A bill whose daily usage exceeds
+what it billed (e.g. after a corrected meter read) has its amount shared across
+those days rather than inflated, and a credit or zero amount is priced at the
+estimate instead. Both are reported in the Home Assistant log.
 
 In the Energy settings, choose **Use an entity tracking the total costs** and
 select the "TPU Energy cost …" (or "TPU Water cost …") statistic.

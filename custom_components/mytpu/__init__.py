@@ -69,12 +69,15 @@ from .const import (
     MIN_UPDATE_INTERVAL_HOURS,
     SERVICE_IMPORT_HISTORY,
 )
-from .models import Bill, Service, ServiceType, UsageReading
-from .pricing import daily_costs
+from .models import Service, ServiceType, UsageReading
+from .pricing import BillUsage, daily_costs, rate_summary, summarize_bills
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+
+# Coordinator data and rate keys for each usage statistic type
+SERVICE_KEYS = {"energy": "power", "water": "water"}
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -235,6 +238,8 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._applied_bill: str | None = None
         self._billing_loaded = False
+        # Rates from bills, by "power"/"water": see pricing.rate_summary
+        self.rates: dict[str, dict[str, Any]] = {}
         self._last_billing_check: datetime | None = None
         self._force_cost_rebuild = False
 
@@ -687,6 +692,13 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return price
 
+    def _estimate_price(self, stat_type: str, price_entity: str | None) -> float | None:
+        """Price for days not yet billed: the price entity, else the bill rate."""
+        price = self._current_price(price_entity)
+        if price is not None:
+            return price
+        return self.rates.get(SERVICE_KEYS[stat_type], {}).get("rate")
+
     async def _import_cost_statistics(
         self,
         service: Service,
@@ -701,9 +713,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         so history is backfilled on first use and days missed while the price
         was unavailable are caught up later. Each day is priced once, at the
         price current when it is first written; later price changes do not
-        rewrite past days.
+        rewrite past days, but the next bill rebuild replaces them. The price
+        is the price entity's value, or else the trailing rate from bills.
         """
-        price = self._current_price(price_entity)
+        price = self._estimate_price(stat_type, price_entity)
         if price is None:
             return
 
@@ -865,10 +878,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Rebuild costs from bills and refresh sensors from the rewritten series.
         # Forgetting the applied bill makes a coordinator created by a reload
         # rebuild too, since the in-memory flag doesn't survive one.
+        await self._async_load_billing()
         self._force_cost_rebuild = True
         self._applied_bill = None
-        self._billing_loaded = True
-        await self._billing_store.async_save({"applied_bill": None})
+        await self._async_save_billing()
         await self.async_request_refresh()
         return result
 
@@ -967,6 +980,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if not cost_jobs:
             return False
+        await self._async_load_billing()
         now = dt_util.utcnow()
         if (
             not self._force_cost_rebuild
@@ -975,11 +989,6 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             < timedelta(hours=BILLING_CHECK_INTERVAL_HOURS)
         ):
             return False
-
-        if not self._billing_loaded:
-            stored = await self._billing_store.async_load() or {}
-            self._applied_bill = stored.get("applied_bill")
-            self._billing_loaded = True
 
         try:
             bills = await self.client.get_billing_history(
@@ -1011,20 +1020,38 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.info("Rebuilding costs from MyTPU bills through %s", latest)
         for job, readings in fetched:
             service, stat_type, statistic_id, new_stats, price_entity, _ = job
+            division = BILLING_DIVISIONS[service.service_type.value]
+            summaries = summarize_bills(readings, bills, division)
+            self.rates[SERVICE_KEYS[stat_type]] = rate_summary(summaries)
             await self._write_billed_costs(
                 service,
                 stat_type,
                 statistic_id,
                 new_stats,
                 readings,
-                bills,
-                self._current_price(price_entity),
+                summaries,
+                self._estimate_price(stat_type, price_entity),
             )
 
         self._applied_bill = latest
         self._force_cost_rebuild = False
-        await self._billing_store.async_save({"applied_bill": latest})
+        await self._async_save_billing()
         return True
+
+    async def _async_load_billing(self) -> None:
+        """Load the last applied bill and bill rates saved by a previous run."""
+        if self._billing_loaded:
+            return
+        stored = await self._billing_store.async_load() or {}
+        self._applied_bill = stored.get("applied_bill")
+        self.rates = stored.get("rates") or {}
+        self._billing_loaded = True
+
+    async def _async_save_billing(self) -> None:
+        """Save the last applied bill and bill rates."""
+        await self._billing_store.async_save(
+            {"applied_bill": self._applied_bill, "rates": self.rates}
+        )
 
     async def _write_billed_costs(
         self,
@@ -1033,7 +1060,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         statistic_id: str,
         new_stats: list[StatisticData],
         readings: list[UsageReading],
-        bills: list[Bill],
+        summaries: dict[date, BillUsage],
         estimate: float | None,
     ) -> None:
         """Replace a meter's cost series with costs priced from bills.
@@ -1055,10 +1082,9 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         usage_days = {float(row["start"]) for row in existing.get(statistic_id, [])}
         usage_days.update(row["start"].timestamp() for row in new_stats)
 
-        division = BILLING_DIVISIONS[service.service_type.value]
         priced = [
             (start, cost)
-            for start, cost in daily_costs(readings, bills, division, estimate)
+            for start, cost in daily_costs(readings, summaries, estimate)
             if start.timestamp() in usage_days
         ]
         if not priced:

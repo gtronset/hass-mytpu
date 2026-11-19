@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from aioresponses import aioresponses
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -13,7 +14,13 @@ from custom_components.mytpu.auth import BASE_URL, MyTPUAuth, TokenInfo
 from custom_components.mytpu.client import MyTPUClient, MyTPUError
 from custom_components.mytpu.const import BILLING_CHECK_INTERVAL_HOURS, DOMAIN
 from custom_components.mytpu.models import Bill, UsageReading
-from custom_components.mytpu.pricing import assign_invoices, daily_costs
+from custom_components.mytpu.pricing import (
+    BillUsage,
+    assign_invoices,
+    daily_costs,
+    rate_summary,
+    summarize_bills,
+)
 
 ENERGY_ID = f"{DOMAIN}:p_mock_power_meter_energy"
 COST_ID = f"{ENERGY_ID}_cost"
@@ -134,8 +141,12 @@ class TestGetBillingHistory:
         assert "Power" in body["billingCategory"]
 
 
+def _costs(readings, bills, division="Power", estimate=None):
+    return daily_costs(readings, summarize_bills(readings, bills, division), estimate)
+
+
 class TestPricing:
-    """assign_invoices and daily_costs."""
+    """assign_invoices, summarize_bills, daily_costs and rate_summary."""
 
     def test_gap_days_join_the_next_bill(self):
         """Days without an invoice before a later billed day belong to that bill."""
@@ -154,14 +165,36 @@ class TestPricing:
             _reading(2, 30.0, NOV_3, billed=40.0),
         ]
         bills = [Bill(date=NOV_3, amounts={"Power": 8.0})]
-        costs = daily_costs(readings, bills, "Power", estimate=None)
-        assert [c for _, c in costs] == [2.0, 6.0]
+        assert [c for _, c in _costs(readings, bills)] == [2.0, 6.0]
 
-    def test_partial_bill_keeps_bill_rate(self):
+    def test_partial_bill_keeps_bill_rate(self, caplog):
         """With only part of a bill's days, the rate still comes from the bill."""
         readings = [_reading(1, 10.0, NOV_3, billed=100.0)]
         bills = [Bill(date=NOV_3, amounts={"Power": 12.0})]
-        assert daily_costs(readings, bills, "Power", None) == [(readings[0].date, 1.2)]
+        with caplog.at_level("INFO"):
+            assert _costs(readings, bills) == [(readings[0].date, 1.2)]
+        assert "covers 10.00 of 100.00 billed usage" in caplog.text
+
+    def test_costs_never_exceed_bill(self, caplog):
+        """Daily usage above the billed usage shares the bill instead of inflating it."""
+        readings = [
+            _reading(1, 10.0, NOV_3, billed=1.0),
+            _reading(2, 10.0, NOV_3, billed=1.0),
+        ]
+        bills = [Bill(date=NOV_3, amounts={"Power": 4.0})]
+        costs = _costs(readings, bills)
+        assert [c for _, c in costs] == [2.0, 2.0]
+        assert sum(c for _, c in costs) == 4.0
+        assert "exceeds billed usage" in caplog.text
+
+    @pytest.mark.parametrize("amount", [0.0, -12.5])
+    def test_credit_bills_use_estimate(self, caplog, amount):
+        """A zero or negative amount is an adjustment, not a rate."""
+        readings = [_reading(1, 10.0, NOV_3, billed=10.0)]
+        bills = [Bill(date=NOV_3, amounts={"Power": amount})]
+        assert [c for _, c in _costs(readings, bills, estimate=0.1)] == [1.0]
+        assert _costs(readings, bills) == []
+        assert "pricing its days at the estimate" in caplog.text
 
     def test_unbilled_days_use_estimate(self):
         """Unbilled days and bills without this division use the estimate."""
@@ -170,15 +203,13 @@ class TestPricing:
             _reading(2, 5.0),  # unbilled
         ]
         bills = [Bill(date=OCT_5, amounts={"Water": 40.0})]
-        costs = daily_costs(readings, bills, "Power", estimate=0.2)
-        assert [c for _, c in costs] == [2.0, 1.0]
+        assert [c for _, c in _costs(readings, bills, estimate=0.2)] == [2.0, 1.0]
 
     def test_unbilled_days_skipped_without_estimate(self):
         """Without an estimate, unbilled days aren't priced."""
         readings = [_reading(1, 10.0, NOV_3, billed=10.0), _reading(2, 5.0)]
         bills = [Bill(date=NOV_3, amounts={"Power": 1.0})]
-        costs = daily_costs(readings, bills, "Power", estimate=None)
-        assert costs == [(readings[0].date, 1.0)]
+        assert _costs(readings, bills) == [(readings[0].date, 1.0)]
 
     def test_bill_without_usage_spreads_evenly(self):
         """A bill that charged for no usage is spread evenly across its days."""
@@ -187,8 +218,25 @@ class TestPricing:
             _reading(2, 0.0, NOV_3, billed=0.0),
         ]
         bills = [Bill(date=NOV_3, amounts={"Water": 30.0})]
-        costs = daily_costs(readings, bills, "Water", estimate=None)
-        assert [c for _, c in costs] == [15.0, 15.0]
+        assert [c for _, c in _costs(readings, bills, "Water")] == [15.0, 15.0]
+
+    def test_rate_summary_uses_trailing_bills(self):
+        """The rate is total charged / total usage over the last 12 bills."""
+        summaries = {
+            date(2025, m, 1): BillUsage(date(2025, m, 1), amount, usage, 30)
+            for m, amount, usage in [(1, 999.0, 1.0)]
+            + [(m, 10.0, 100.0) for m in range(2, 13)]
+        }
+        summaries[date(2026, 1, 1)] = BillUsage(date(2026, 1, 1), 30.0, 100.0, 30)
+
+        summary = rate_summary(summaries)
+
+        # The 13th-oldest bill (999/1) falls outside the trailing window
+        assert summary["bills"] == 12
+        assert summary["rate"] == round((11 * 10.0 + 30.0) / (12 * 100.0), 6)
+        assert summary["last_bill_rate"] == 0.3
+        assert summary["last_bill_date"] == "2026-01-01"
+        assert rate_summary({}) == {}
 
 
 def _recorder() -> MagicMock:
@@ -259,8 +307,19 @@ class TestRebuildBilledCosts:
         assert [s["state"] for s in stats] == [0.0, 2.0, 2.0]
         assert [s["sum"] for s in stats] == [0.0, 2.0, 4.0]
         coordinator._billing_store.async_save.assert_awaited_once_with(
-            {"applied_bill": "2026-11-03"}
+            {
+                "applied_bill": "2026-11-03",
+                "rates": {
+                    "power": {
+                        "rate": 0.2,
+                        "bills": 1,
+                        "last_bill_rate": 0.2,
+                        "last_bill_date": "2026-11-03",
+                    }
+                },
+            }
         )
+        assert coordinator.rates["power"]["rate"] == 0.2
 
     async def test_same_bill_skips_rebuild(
         self, hass: HomeAssistant, make_config_entry
@@ -389,6 +448,46 @@ class TestRebuildBilledCosts:
 
         assert coordinator._force_cost_rebuild is True
         coordinator._billing_store.async_save.assert_awaited_once_with(
-            {"applied_bill": None}
+            {"applied_bill": None, "rates": {}}
         )
         coordinator.async_request_refresh.assert_awaited_once()
+
+
+class TestEstimatePrice:
+    """The price used for days not yet billed."""
+
+    async def test_price_entity_overrides_bill_rate(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """A valid price entity wins; otherwise the trailing bill rate is used."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        coordinator.rates = {"power": {"rate": 0.12}}
+        hass.states.async_set("input_number.price", "0.15")
+
+        assert coordinator._estimate_price("energy", "input_number.price") == 0.15
+        assert coordinator._estimate_price("energy", None) == 0.12
+        hass.states.async_set("input_number.price", "unavailable")
+        assert coordinator._estimate_price("energy", "input_number.price") == 0.12
+        assert coordinator._estimate_price("water", None) is None
+
+    async def test_incremental_import_uses_bill_rate(
+        self, hass: HomeAssistant, make_config_entry, mock_power_service
+    ):
+        """Without a price entity, new days are priced at the trailing bill rate."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        coordinator.rates = {"power": {"rate": 0.5}}
+        day = _reading(1).date
+        last = {COST_ID: [{"start": (day - timedelta(days=1)).timestamp(), "sum": 1.0}]}
+        rows = {ENERGY_ID: [{"start": day.timestamp(), "state": 4.0}]}
+        with (
+            patch("custom_components.mytpu.get_last_statistics", return_value=last),
+            patch(
+                "custom_components.mytpu.statistics_during_period", return_value=rows
+            ),
+            patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
+        ):
+            await coordinator._import_cost_statistics(
+                mock_power_service, "energy", ENERGY_ID, [], None
+            )
+        stats = mock_add.call_args.args[2]
+        assert [(s["state"], s["sum"]) for s in stats] == [(2.0, 3.0)]
