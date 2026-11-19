@@ -73,7 +73,7 @@ from .const import (
     SERVICE_IMPORT_HISTORY,
     USAGE_TOLERANCE,
 )
-from .models import Service, ServiceType, UsageReading
+from .models import Bill, Service, ServiceType, UsageReading
 from .pricing import BillUsage, daily_costs, rate_summary, summarize_bills
 
 _LOGGER = logging.getLogger(__name__)
@@ -242,6 +242,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         # Last bill applied to each meter, by "power"/"water"
         self._applied_bills: dict[str, str] = {}
+        # Meters whose whole cost series must be repriced (after an import),
+        # and meters with usage days left unpriced for lack of an estimate
+        self._needs_reprice: set[str] = set()
+        self._unpriced: set[str] = set()
         self._billing_loaded = False
         self._warned_shared_meters: set[str] = set()
         # Rates from bills, by "power"/"water": see pricing.rate_summary
@@ -443,6 +447,17 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             rebuilt: set[str] = set()
             if not any(job[5] for job in cost_jobs):
                 rebuilt = await self._maybe_rebuild_billed_costs(cost_jobs)
+                # Days skipped earlier for lack of an estimate are filled once
+                # one exists; the incremental import only prices later days
+                rebuilt |= await self._reprice_at_estimate(
+                    [
+                        job
+                        for job in cost_jobs
+                        if job[1] not in rebuilt
+                        and SERVICE_KEYS[job[1]] in self._unpriced
+                    ],
+                    fill_only=True,
+                )
             for (
                 service,
                 stat_type,
@@ -873,7 +888,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Record that every meter needs repricing before rewriting anything,
             # so a failure or reload partway through still leads to a rebuild
             await self._async_load_billing()
-            self._applied_bills = {}
+            self._needs_reprice = {key for _, _, key, _ in fetched}
             self._force_cost_rebuild = True
             await self._async_save_billing()
 
@@ -998,11 +1013,13 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Reprice meters' costs from bills when a statement they lack appears.
 
         Checks billing history at most once per BILLING_CHECK_INTERVAL_HOURS,
-        unless a history import asked for a rebuild. Returns the stat types
-        whose costs were rebuilt; the incremental cost import skips those.
-        A meter is marked applied only once its costs are written, so a meter
-        with nothing to price yet is retried at the next check. Failed
-        requests are logged and retried on the next update.
+        or right away after a history import. A meter is repriced when its
+        division has a bill newer than the one last applied to it, or when an
+        import left it needing a full reprice; meters that can't be priced
+        from bills are repriced at the estimate instead. Work is marked done
+        only once that meter's costs are written, so anything unfinished is
+        retried at the next check. Returns the stat types whose costs were
+        written; the incremental cost import skips those.
         """
         if not cost_jobs:
             return set()
@@ -1025,52 +1042,51 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Fetching MyTPU billing history failed: %s", err)
             return set()
         self._last_billing_check = now
+        self._force_cost_rebuild = False
 
-        # Meters that can't be priced from bills (no bills yet, or a shared
-        # meter type) are repriced at the estimate after a history import,
-        # since the incremental import only prices days after its last row.
-        priceable = (
-            [
-                job
-                for job in cost_jobs
-                if self._bills_attributable(job[0], job[1], account_services)
-            ]
-            if bills
-            else []
-        )
-        rebuilt: set[str] = set()
-        if self._force_cost_rebuild:
-            rebuilt |= await self._reprice_at_estimate(
-                [job for job in cost_jobs if job not in priceable]
-            )
-        if not bills:
-            self._force_cost_rebuild = False
-            return rebuilt
+        # Each meter is compared with the latest bill for its own division
+        pending: list[tuple[tuple, Bill]] = []
+        estimate_only: list[tuple] = []
+        for job in cost_jobs:
+            service, stat_type = job[0], job[1]
+            key = SERVICE_KEYS[stat_type]
+            division = BILLING_DIVISIONS[service.service_type.value]
+            division_bills = [b for b in bills if b.amounts.get(division) is not None]
+            if not division_bills or not self._bills_attributable(
+                service, stat_type, account_services
+            ):
+                if key in self._needs_reprice:
+                    estimate_only.append(job)
+                continue
+            latest = max(division_bills, key=lambda bill: bill.date)
+            if (
+                key in self._needs_reprice
+                or self._applied_bills.get(key) != latest.date.isoformat()
+            ):
+                pending.append((job, latest))
 
-        latest_bill = max(bills, key=lambda bill: bill.date)
-        latest = latest_bill.date.isoformat()
-        pending = [
-            job
-            for job in priceable
-            if self._applied_bills.get(SERVICE_KEYS[job[1]]) != latest
-        ]
+        rebuilt = await self._reprice_at_estimate(estimate_only)
         if not pending:
-            self._force_cost_rebuild = False
             return rebuilt
 
         # Re-fetch usage so each day carries the bill that charged for it. Fetch
         # every meter before writing, so a failure leaves all costs as they were.
         try:
             fetched = [
-                (job, await self._fetch_history(job[0], None)) for job in pending
+                (job, latest, await self._fetch_history(job[0], None))
+                for job, latest in pending
             ]
         except (MyTPUError, TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.warning("Fetching usage to price from bills failed: %s", err)
             self._last_billing_check = None
             return rebuilt
 
-        _LOGGER.info("Repricing costs from MyTPU bills through %s", latest)
-        for job, readings in fetched:
+        # Usage imported earlier in this update is only queued; a correction
+        # rewrite reading the series before it commits would drop those days
+        if any(job[3] for job, _, _ in fetched):
+            await self._clear_and_wait_for_recorder([], "usage import")
+
+        for job, latest, readings in fetched:
             service, stat_type, statistic_id, new_stats, price_entity, _ = job
             key = SERVICE_KEYS[stat_type]
             await self._apply_corrections(service, stat_type, statistic_id, readings)
@@ -1078,7 +1094,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             division = BILLING_DIVISIONS[service.service_type.value]
             summaries = summarize_bills(readings, bills, division)
             self.rates[key] = rate_summary(summaries)
-            written = await self._write_billed_costs(
+            invoices = await self._write_billed_costs(
                 service,
                 stat_type,
                 statistic_id,
@@ -1087,23 +1103,23 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 summaries,
                 self._estimate_price(stat_type, price_entity),
             )
-            if written:
-                rebuilt.add(stat_type)
-            # Applied only once the latest bill's own days were priced; until
-            # its rows carry the invoice, retry at the next check
-            amount = latest_bill.amounts.get(division)
-            if written and (
-                latest_bill.date in summaries or amount is None or amount <= 0
-            ):
-                self._applied_bills[key] = latest
+            if invoices is None:
+                _LOGGER.info("No %s usage to price from bills yet", key)
+                continue
+            rebuilt.add(stat_type)
+            self._needs_reprice.discard(key)
+            # Applied only once the latest bill's own days were written (a credit
+            # or zero bill has no rate to wait for); otherwise retry next check
+            if latest.date in invoices or latest.amounts[division] <= 0:
+                self._applied_bills[key] = latest.date.isoformat()
+                _LOGGER.info("Priced %s costs from bills through %s", key, latest.date)
             else:
                 _LOGGER.info(
                     "%s usage for the %s bill isn't available yet; will retry",
                     key,
-                    latest,
+                    latest.date,
                 )
 
-        self._force_cost_rebuild = False
         await self._async_save_billing()
         return rebuilt
 
@@ -1112,8 +1128,15 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cost_jobs: list[
             tuple[Service, str, str, list[StatisticData], str | None, bool]
         ],
+        *,
+        fill_only: bool = False,
     ) -> set[str]:
-        """Reprice every usage day of these meters at the estimate."""
+        """Reprice these meters' usage days at the estimate.
+
+        With fill_only, only days without a cost are priced. Returns the stat
+        types whose costs were written; a full reprice also clears the meter's
+        pending reprice.
+        """
         rebuilt: set[str] = set()
         for service, stat_type, statistic_id, new_stats, price_entity, _ in cost_jobs:
             estimate = self._estimate_price(stat_type, price_entity)
@@ -1128,10 +1151,22 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 for day, consumption in sorted(usage.items())
             ]
-            if await self._write_billed_costs(
-                service, stat_type, statistic_id, new_stats, readings, {}, estimate
-            ):
+            written = await self._write_billed_costs(
+                service,
+                stat_type,
+                statistic_id,
+                new_stats,
+                readings,
+                {},
+                estimate,
+                fill_only=fill_only,
+            )
+            if written is not None:
                 rebuilt.add(stat_type)
+                if not fill_only:
+                    self._needs_reprice.discard(SERVICE_KEYS[stat_type])
+        if rebuilt:
+            await self._async_save_billing()
         return rebuilt
 
     async def _apply_corrections(
@@ -1248,13 +1283,20 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         stored = await self._billing_store.async_load() or {}
         self._applied_bills = stored.get("applied") or {}
+        self._needs_reprice = set(stored.get("needs_reprice") or [])
+        self._unpriced = set(stored.get("unpriced") or [])
         self.rates = stored.get("rates") or {}
         self._billing_loaded = True
 
     async def _async_save_billing(self) -> None:
         """Save applied bills and bill rates."""
         await self._billing_store.async_save(
-            {"applied": self._applied_bills, "rates": self.rates}
+            {
+                "applied": self._applied_bills,
+                "needs_reprice": sorted(self._needs_reprice),
+                "unpriced": sorted(self._unpriced),
+                "rates": self.rates,
+            }
         )
 
     async def _write_billed_costs(
@@ -1266,23 +1308,27 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         readings: list[UsageReading],
         summaries: dict[date, BillUsage],
         estimate: float | None,
-    ) -> bool:
+        *,
+        fill_only: bool = False,
+    ) -> set[date] | None:
         """Reprice a meter's cost series, keeping what can't be repriced.
 
         Every usage day gets its repriced cost, or else its existing cost
         (e.g. days older than MyTPU's history, or estimates when no estimate
-        is available now). Days that only have a cost are kept too. Running
-        totals are recalculated. Returns False, writing nothing, if no usage
-        day could be repriced.
+        is available now). Days that only have a cost are kept too. With
+        fill_only, existing costs are never replaced. Running totals are
+        recalculated, and whether any usage day is still unpriced is
+        remembered so it can be filled once an estimate exists.
+
+        Returns the invoices whose days were written (unbilled days have none),
+        or None, writing nothing, if no usage day could be priced.
         """
         usage = await self._usage_days(statistic_id, new_stats)
         repriced = {
-            start.timestamp(): cost
-            for start, cost in daily_costs(readings, summaries, estimate)
+            start.timestamp(): (cost, invoice)
+            for start, cost, invoice in daily_costs(readings, summaries, estimate)
             if start.timestamp() in usage
         }
-        if not repriced:
-            return False
 
         metadata = self._cost_metadata(service, stat_type)
         cost_id = metadata["statistic_id"]
@@ -1304,11 +1350,23 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if previous and previous[min(previous)] == 0.0:
             del previous[min(previous)]
 
+        if fill_only:
+            repriced = {day: v for day, v in repriced.items() if day not in previous}
+        if not repriced:
+            return None
+
         priced: list[tuple[float, float]] = []
         for day in sorted(set(usage) | set(previous)):
-            cost = repriced.get(day, previous.get(day))
-            if cost is not None:
-                priced.append((day, cost))
+            if day in repriced:
+                priced.append((day, repriced[day][0]))
+            elif day in previous:
+                priced.append((day, previous[day]))
+
+        key = SERVICE_KEYS[stat_type]
+        if any(day not in repriced and day not in previous for day in usage):
+            self._unpriced.add(key)
+        else:
+            self._unpriced.discard(key)
 
         first = datetime.fromtimestamp(priced[0][0], tz=UTC)
         statistics = [
@@ -1328,4 +1386,4 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         get_instance(self.hass).async_clear_statistics([cost_id])
         async_add_external_statistics(self.hass, metadata, statistics)
         await self._clear_and_wait_for_recorder([], f"{stat_type} cost rebuild")
-        return True
+        return {invoice for _, invoice in repriced.values() if invoice is not None}

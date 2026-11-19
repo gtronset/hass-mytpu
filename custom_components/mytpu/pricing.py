@@ -120,16 +120,17 @@ def daily_costs(
     readings: list[UsageReading],
     summaries: dict[date, BillUsage],
     estimate: float | None,
-) -> list[tuple[datetime, float]]:
-    """Return (day start, cost) for each reading that can be priced.
+) -> list[tuple[datetime, float, date | None]]:
+    """Return (day start, cost, invoice) for each reading that can be priced.
 
     A billed day costs its usage times its bill's amount divided by the
     bill's usage (see summarize_bills). A bill with no usage at all is spread
     evenly over its days. Days without a usable bill use the estimate price;
-    without one they're skipped.
+    without one they're skipped. The invoice is the bill the day belongs to,
+    or None for unbilled days.
     """
     readings = sorted(readings, key=lambda reading: reading.date)
-    costs: list[tuple[datetime, float]] = []
+    costs: list[tuple[datetime, float, date | None]] = []
     for reading, invoice in zip(readings, assign_invoices(readings), strict=True):
         summary = summaries.get(invoice) if invoice is not None else None
         if summary is not None and summary.usage > 0:
@@ -140,7 +141,7 @@ def daily_costs(
             cost = reading.consumption * estimate
         else:
             continue
-        costs.append((reading.date, round(cost, 4)))
+        costs.append((reading.date, round(cost, 4), invoice))
     return costs
 
 
