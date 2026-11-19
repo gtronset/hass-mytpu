@@ -304,7 +304,9 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Save updated token data to config entry if changed
             await self._save_token_data()
 
-            data: dict[str, Any] = {}
+            # Keep each service's last reading when an update brings no new one
+            # (most hourly updates, since TPU publishes one reading a day)
+            data: dict[str, Any] = dict(self.data or {})
             # (service, stat_type, statistic_id, new rows, price entity, migrated)
             cost_jobs: list[
                 tuple[Service, str, str, list[StatisticData], str | None, bool]
@@ -319,7 +321,12 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     + "_energy"
                 )
                 last_power_stats = await get_instance(self.hass).async_add_executor_job(
-                    get_last_statistics, self.hass, 1, power_statistic_id, True, {"sum"}
+                    get_last_statistics,
+                    self.hass,
+                    1,
+                    power_statistic_id,
+                    True,
+                    {"sum", "state"},
                 )
                 last_power_stat_time: float | None = None
                 last_power_sum = 0.0
@@ -365,6 +372,14 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "date": latest.date,
                         "unit": latest.unit,
                     }
+                elif "power" not in data and last_power_stat_time is not None:
+                    # After a restart, show the last stored reading until a new one
+                    # (its start is the migrated one if the series was just migrated)
+                    data["power"] = self._reading_from_statistic(
+                        last_power_stats[power_statistic_id][0],
+                        last_power_stat_time,
+                        "KWH",
+                    )
 
                 cost_jobs.append(
                     (
@@ -386,7 +401,12 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     + "_water"
                 )
                 last_water_stats = await get_instance(self.hass).async_add_executor_job(
-                    get_last_statistics, self.hass, 1, water_statistic_id, True, {"sum"}
+                    get_last_statistics,
+                    self.hass,
+                    1,
+                    water_statistic_id,
+                    True,
+                    {"sum", "state"},
                 )
                 last_water_stat_time: float | None = None
                 last_water_sum = 0.0
@@ -432,6 +452,14 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "date": latest.date,
                         "unit": latest.unit,
                     }
+                elif "water" not in data and last_water_stat_time is not None:
+                    # After a restart, show the last stored reading until a new one
+                    # (its start is the migrated one if the series was just migrated)
+                    data["water"] = self._reading_from_statistic(
+                        last_water_stats[water_statistic_id][0],
+                        last_water_stat_time,
+                        "CCF",
+                    )
 
                 cost_jobs.append(
                     (
@@ -496,6 +524,17 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(
                 f"Unexpected error communicating with TPU: {err}"
             ) from err
+
+    @staticmethod
+    def _reading_from_statistic(
+        stat: dict[str, Any], start: float, unit: str
+    ) -> dict[str, Any]:
+        """Return sensor data for a stored usage statistic row."""
+        return {
+            "consumption": float(stat.get("state") or 0.0),
+            "date": datetime.fromtimestamp(start, tz=UTC),
+            "unit": unit,
+        }
 
     def _refresh_when_started(self) -> None:
         """Request one refresh once Home Assistant has finished starting."""

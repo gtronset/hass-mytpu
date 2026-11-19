@@ -846,3 +846,56 @@ class TestTPUDataUpdateCoordinator:
 
             # Hyphens should be replaced with underscores and lowercased (metadata is a dict)
             assert metadata["statistic_id"] == f"{DOMAIN}:p_mtr_123_abc_energy"
+
+
+class TestSensorDataBetweenReadings:
+    """Sensor data survives updates that bring no new reading."""
+
+    def _coordinator(self, hass, make_config_entry):
+        entry = make_config_entry(include_power=True)
+        client = AsyncMock()
+        client.get_token_data = lambda: entry.data.get("token_data")
+        return TPUDataUpdateCoordinator(hass, client, entry)
+
+    async def test_follow_up_refresh_keeps_last_reading(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """A full refresh with no new readings keeps the previous one."""
+        coordinator = self._coordinator(hass, make_config_entry)
+        day = datetime(2026, 11, 17, 8, tzinfo=UTC)
+        reading = UsageReading(date=day, consumption=27.5, unit="KWH")
+        coordinator.client.get_usage = AsyncMock(side_effect=[[reading], []])
+
+        with (
+            patch("custom_components.mytpu.get_last_statistics", return_value={}),
+            patch("custom_components.mytpu.async_add_external_statistics"),
+        ):
+            await coordinator.async_refresh()
+            assert coordinator.data["power"]["consumption"] == 27.5
+            await coordinator.async_refresh()
+
+        assert coordinator.last_update_success
+        assert coordinator.data["power"] == {
+            "consumption": 27.5,
+            "date": day,
+            "unit": "KWH",
+        }
+
+    async def test_restart_shows_last_stored_reading(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """With no previous data and no new reading, the last statistic is shown."""
+        coordinator = self._coordinator(hass, make_config_entry)
+        coordinator.client.get_usage = AsyncMock(return_value=[])
+        start = datetime(2026, 11, 17, 8, tzinfo=UTC).timestamp()
+        statistic_id = "mytpu:p_mock_power_meter_energy"
+        last = {statistic_id: [{"start": start, "state": 31.2, "sum": 900.0}]}
+
+        with patch("custom_components.mytpu.get_last_statistics", return_value=last):
+            data = await coordinator._do_fetch()
+
+        assert data["power"] == {
+            "consumption": 31.2,
+            "date": datetime.fromtimestamp(start, tz=UTC),
+            "unit": "KWH",
+        }
