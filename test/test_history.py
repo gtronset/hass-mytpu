@@ -210,6 +210,33 @@ class TestImportHistory:
         await hass.async_block_till_done()
         assert await coordinator._async_update_data() == {"fresh": True}
 
+    async def test_pending_commit_survives_reload(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """A coordinator replacing one on reload stays blocked by its pending rewrite."""
+        entry = make_config_entry(include_power=True)
+        old = _coordinator(hass, entry)
+        old.client.get_usage = AsyncMock(side_effect=[[_day(1)], []])
+        recorder = MagicMock()  # never calls on_done
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.HISTORY_COMMIT_TIMEOUT_SECONDS", 0.01),
+            patch("custom_components.mytpu.async_add_external_statistics"),
+            pytest.raises(HomeAssistantError, match="updates are paused"),
+        ):
+            await old.async_import_history()
+
+        # The entry reloads: a fresh coordinator for the same entry
+        new = _coordinator(hass, entry)
+        new._do_fetch = AsyncMock(return_value={"fresh": True})
+        assert await new._async_update_data() == {}
+        new._do_fetch.assert_not_awaited()
+
+        recorder.async_clear_statistics.call_args.kwargs["on_done"]()
+        await hass.async_block_till_done()
+        assert await new._async_update_data() == {"fresh": True}
+
 
 class TestImportHistoryAction:
     """The mytpu.import_history action."""

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import math
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -94,6 +95,22 @@ def _service_from_config(config_json: str) -> Service:
         contract_number=data.get("contract_number"),
         totalizer=data.get("totalizer", False),
     )
+
+
+@dataclass
+class _StatisticsGuard:
+    """Per-entry write state that must outlive a coordinator across reloads."""
+
+    # Keeps scheduled updates and history imports from interleaving writes
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Set by a statistics rewrite whose recorder commit hasn't been confirmed
+    pending_commit: asyncio.Event | None = None
+
+
+def _statistics_guard(hass: HomeAssistant, entry_id: str) -> _StatisticsGuard:
+    """Return the entry's guard, shared by every coordinator created for it."""
+    guards: dict[str, _StatisticsGuard] = hass.data.setdefault(f"{DOMAIN}_guards", {})
+    return guards.setdefault(entry_id, _StatisticsGuard())
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -191,10 +208,9 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.client = client
         self.config_entry = config_entry
-        # Keeps scheduled updates and history imports from interleaving writes
-        self._update_lock = asyncio.Lock()
-        # Set by a history rewrite whose recorder commit hasn't been confirmed
-        self._history_commit: asyncio.Event | None = None
+        # Shared with any coordinator that replaces this one on reload, so a
+        # rewrite still awaiting the recorder keeps blocking the new one too
+        self._guard = _statistics_guard(hass, config_entry.entry_id)
 
         # Parse service configs from JSON
         self.power_service: Service | None = None
@@ -210,7 +226,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data, re-logging in automatically if token refresh fails."""
-        async with self._update_lock:
+        async with self._guard.lock:
             if self._history_commit_pending():
                 # Reading statistics now could continue the old running totals
                 _LOGGER.debug("Skipping update until the history rewrite commits")
@@ -745,7 +761,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if service
         ]
 
-        async with self._update_lock:
+        async with self._guard.lock:
             if self._history_commit_pending():
                 raise HomeAssistantError(
                     "The previous history import hasn't been committed by the "
@@ -828,9 +844,10 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _history_commit_pending(self) -> bool:
         """Return True while a history rewrite awaits recorder confirmation."""
-        if self._history_commit is not None and self._history_commit.is_set():
-            self._history_commit = None
-        return self._history_commit is not None
+        guard = self._guard
+        if guard.pending_commit is not None and guard.pending_commit.is_set():
+            guard.pending_commit = None
+        return guard.pending_commit is not None
 
     async def _rewrite_statistics(
         self, service: Service, stat_type: str, readings: list[UsageReading]
@@ -848,7 +865,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._import_statistics(service, readings, stat_type)
 
         committed = asyncio.Event()
-        self._history_commit = committed
+        self._guard.pending_commit = committed
         recorder.async_clear_statistics(
             [f"{statistic_id}_cost"],
             on_done=lambda: self.hass.loop.call_soon_threadsafe(committed.set),
@@ -862,4 +879,4 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"within {HISTORY_COMMIT_TIMEOUT_SECONDS}s; updates are paused "
                 "until it does"
             ) from err
-        self._history_commit = None
+        self._guard.pending_commit = None
