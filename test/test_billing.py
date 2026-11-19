@@ -497,9 +497,9 @@ class TestRebuildBilledCosts:
         coordinator._fetch_history = AsyncMock(return_value=[])
         coordinator._write_billed_costs = AsyncMock(return_value=True)
 
-        assert await coordinator._maybe_rebuild_billed_costs([_job(coordinator)]) == {
-            "energy"
-        }
+        with patch("custom_components.mytpu.statistics_during_period", return_value={}):
+            rebuilt = await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+        assert rebuilt == {"energy"}
         assert coordinator._force_cost_rebuild is False
 
     @pytest.mark.parametrize(
@@ -603,7 +603,8 @@ class TestRebuildBilledCosts:
         )
         coordinator.async_request_refresh = AsyncMock()
 
-        await coordinator.async_import_history()
+        with patch("custom_components.mytpu.statistics_during_period", return_value={}):
+            await coordinator.async_import_history()
 
         assert order == ["save {}", "rewrite"]
         assert coordinator._force_cost_rebuild is True
@@ -648,3 +649,166 @@ class TestEstimatePrice:
             )
         stats = mock_add.call_args.args[2]
         assert [(s["state"], s["sum"]) for s in stats] == [(2.0, 3.0)]
+
+
+class TestReviewFollowUps:
+    """Merging, estimate repricing, applied bills, corrections and rates."""
+
+    async def test_import_merge_keeps_older_usage(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """Merging history keeps stored days TPU didn't return; TPU's values win."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        older, kept, updated = _reading(1, 5.0), _reading(2, 6.0), _reading(3, 7.0)
+        coordinator._rewrite_statistics = AsyncMock()
+
+        with patch(
+            "custom_components.mytpu.statistics_during_period",
+            side_effect=_period({ENERGY_ID: _usage_rows([older, kept, updated])}),
+        ):
+            await coordinator._merge_usage(
+                coordinator.power_service,
+                "energy",
+                [_reading(3, 9.0), _reading(4, 1.0)],
+            )
+
+        written = coordinator._rewrite_statistics.await_args.args[2]
+        assert [(r.date, r.consumption) for r in written] == [
+            (older.date, 5.0),
+            (kept.date, 6.0),
+            (updated.date, 9.0),
+            (_reading(4).date, 1.0),
+        ]
+
+    async def test_rebuild_keeps_cost_only_days(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """Costs for days no longer in the usage series aren't dropped."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        gone, billed = _reading(1), _reading(2, 10.0, NOV_3, billed=10.0)
+        old_costs = [
+            {"start": (gone.date - timedelta(days=1)).timestamp(), "state": 0.0},
+            {"start": gone.date.timestamp(), "state": 2.5},
+        ]
+        coordinator.client.get_billing_history = AsyncMock(
+            return_value=[Bill(date=NOV_3, amounts={"Power": 3.0})]
+        )
+        coordinator._fetch_history = AsyncMock(return_value=[billed])
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=_recorder()),
+            patch(
+                "custom_components.mytpu.statistics_during_period",
+                side_effect=_period(
+                    {ENERGY_ID: _usage_rows([billed]), COST_ID: old_costs}
+                ),
+            ),
+            patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
+        ):
+            await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+
+        stats = mock_add.call_args.args[2]
+        assert [(s["start"], s["state"], s["sum"]) for s in stats[1:]] == [
+            (gone.date, 2.5, 2.5),
+            (billed.date, 3.0, 5.5),
+        ]
+
+    @pytest.mark.parametrize("shared", [False, True])
+    async def test_import_reprices_unbillable_meters_at_estimate(
+        self, hass: HomeAssistant, make_config_entry, shared
+    ):
+        """After an import, meters without usable bills are repriced at the estimate."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        coordinator._force_cost_rebuild = True
+        hass.states.async_set("input_number.price", "0.5")
+        if shared:
+            other = MagicMock(service_type=coordinator.power_service.service_type)
+            coordinator.client.get_services = AsyncMock(
+                return_value=[coordinator.power_service, other]
+            )
+        coordinator.client.get_billing_history = AsyncMock(
+            return_value=[Bill(date=NOV_3, amounts={"Power": 3.0})] if shared else []
+        )
+        days = [_reading(1, 2.0), _reading(2, 4.0)]
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=_recorder()),
+            patch(
+                "custom_components.mytpu.statistics_during_period",
+                side_effect=_period({ENERGY_ID: _usage_rows(days)}),
+            ),
+            patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
+        ):
+            rebuilt = await coordinator._maybe_rebuild_billed_costs(
+                [_job(coordinator, "input_number.price")]
+            )
+
+        assert rebuilt == {"energy"}
+        assert [s["state"] for s in mock_add.call_args.args[2]] == [0.0, 1.0, 2.0]
+        assert coordinator._force_cost_rebuild is False
+
+    async def test_latest_bill_without_its_days_is_retried(
+        self, hass: HomeAssistant, make_config_entry
+    ):
+        """A new statement whose days aren't labeled yet isn't marked applied."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        older = _reading(1, 10.0, OCT_5, billed=10.0)
+        unlabeled = _reading(2, 10.0)  # NOV_3's days, before TPU labels them
+        coordinator.client.get_billing_history = AsyncMock(
+            return_value=[
+                Bill(date=OCT_5, amounts={"Power": 1.0}),
+                Bill(date=NOV_3, amounts={"Power": 2.0}),
+            ]
+        )
+        coordinator._fetch_history = AsyncMock(return_value=[older, unlabeled])
+
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=_recorder()),
+            patch(
+                "custom_components.mytpu.statistics_during_period",
+                side_effect=_period({ENERGY_ID: _usage_rows([older, unlabeled])}),
+            ),
+            patch("custom_components.mytpu.async_add_external_statistics"),
+        ):
+            rebuilt = await coordinator._maybe_rebuild_billed_costs([_job(coordinator)])
+
+        assert rebuilt == {"energy"}  # older bill and estimates still written
+        assert "power" not in coordinator._applied_bills
+
+    @pytest.mark.parametrize(("tpu_value", "merged"), [(20.0, True), (10.0, False)])
+    async def test_corrected_readings_update_usage(
+        self, hass: HomeAssistant, make_config_entry, tpu_value, merged
+    ):
+        """A stored day whose TPU reading changed is rewritten before pricing."""
+        coordinator = _coordinator(hass, make_config_entry(include_power=True))
+        stored = _reading(1, 10.0)
+        coordinator._merge_usage = AsyncMock()
+
+        with patch(
+            "custom_components.mytpu.statistics_during_period",
+            side_effect=_period({ENERGY_ID: _usage_rows([stored])}),
+        ):
+            await coordinator._apply_corrections(
+                coordinator.power_service,
+                "energy",
+                ENERGY_ID,
+                [_reading(1, tpu_value), _reading(5, 3.0)],
+            )
+
+        if merged:
+            readings = coordinator._merge_usage.await_args.args[2]
+            # Only days already stored are updated; others aren't added
+            assert [(r.date, r.consumption) for r in readings] == [(stored.date, 20.0)]
+        else:
+            coordinator._merge_usage.assert_not_awaited()
+
+    def test_rate_summary_counts_zero_usage_bills(self):
+        """Fixed charges on a zero-usage bill still count toward the rate."""
+        summaries = {
+            OCT_5: BillUsage(OCT_5, 100.0, 10.0, 30),
+            NOV_3: BillUsage(NOV_3, 30.0, 0.0, 30),
+        }
+        summary = rate_summary(summaries)
+        assert summary["rate"] == 13.0
+        assert summary["last_bill_date"] == "2026-11-03"
+        assert "last_bill_rate" not in summary

@@ -129,12 +129,17 @@ data:
 
 The integration fetches history backward from today, a year at a time, until
 MyTPU returns no more readings. Only once every meter has been fetched does it
-replace the usage statistics. If a request fails, the existing statistics are
-left alone. Cost statistics are then rebuilt from your bills.
+merge the history into the usage statistics: days MyTPU returns take its values,
+and days it doesn't (older than its history, or before `start_date`) are kept.
+If a request fails, the existing statistics are left alone. Costs are then
+repriced from your bills.
 
 The action returns the number of days and the date range imported for each
-meter. It can only be run by an administrator. Taking a Home Assistant backup first is a good idea, since the existing
-usage statistics are replaced.
+meter. It can only be run by an administrator. Taking a Home Assistant backup
+first is a good idea, since the usage statistics are rewritten.
+
+Days MyTPU later corrects (for example an estimated reading replaced by a
+confirmed one) are also updated whenever a new bill is priced.
 
 ## Acknowledgments
 

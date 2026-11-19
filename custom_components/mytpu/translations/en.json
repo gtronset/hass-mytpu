@@ -68,7 +68,7 @@
   "services": {
     "import_history": {
       "name": "Import history",
-      "description": "Replaces the usage statistics with all history MyTPU still has (about two years), then rebuilds cost statistics from your bills.",
+      "description": "Adds all history MyTPU still has (about two years) to the usage statistics, updating days it returns and keeping older ones, then reprices costs from your bills.",
       "fields": {
         "config_entry_id": {
           "name": "Account",

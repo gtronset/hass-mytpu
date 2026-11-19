@@ -13,6 +13,7 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -115,3 +116,33 @@ async def test_billed_cost_rebuild_committed_before_return(
         get_last_statistics, hass, 1, f"{ENERGY_ID}_cost", True, {"sum"}
     )
     assert cost[f"{ENERGY_ID}_cost"][0]["sum"] == 5.0
+
+
+async def test_import_keeps_days_tpu_no_longer_returns(
+    hass: HomeAssistant, make_config_entry
+):
+    """With a real recorder, stored days older than TPU's history survive an import."""
+    entry = make_config_entry(include_power=True)
+    coordinator = cast(Any, TPUDataUpdateCoordinator(hass, AsyncMock(), entry))
+    coordinator.client.get_token_data = lambda: entry.data.get("token_data")
+    coordinator.async_request_refresh = AsyncMock()
+    service = coordinator.power_service
+    await coordinator._import_statistics(service, [_day(10), _day(3)], "energy")
+    await async_wait_recording_done(hass)
+
+    coordinator.client.get_usage = AsyncMock(side_effect=[[_day(4), _day(3)], []])
+    await coordinator.async_import_history()
+
+    rows = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utcnow() - timedelta(days=30),
+        None,
+        {ENERGY_ID},
+        "hour",
+        None,
+        {"sum"},
+    )
+    starts = [row["start"] for row in rows[ENERGY_ID]]
+    assert _day(10).date.timestamp() in starts
+    assert rows[ENERGY_ID][-1]["sum"] == 3.0  # days 10, 4 and 3

@@ -71,6 +71,7 @@ from .const import (
     MAX_HISTORY_CHUNKS,
     MIN_UPDATE_INTERVAL_HOURS,
     SERVICE_IMPORT_HISTORY,
+    USAGE_TOLERANCE,
 )
 from .models import Service, ServiceType, UsageReading
 from .pricing import BillUsage, daily_costs, rate_summary, summarize_bills
@@ -826,12 +827,14 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_import_history(
         self, start_date: date | None = None
     ) -> dict[str, Any]:
-        """Replace usage statistics with all history TPU returns.
+        """Merge all history TPU returns into the usage statistics.
 
-        Fetches every configured meter before touching the recorder, so a
-        failed request leaves existing statistics untouched. Costs are kept;
-        the refresh that follows reprices them from bills, merging with the
-        existing costs for any day it can't reprice.
+        Days TPU returns take its values; days it doesn't (older than its
+        history, or before start_date) are kept. Fetches every configured
+        meter before touching the recorder, so a failed request leaves
+        existing statistics untouched. Costs are kept; the refresh that
+        follows reprices them, merging with existing costs for any day it
+        can't reprice.
         """
         services = [
             (service, stat_type, key)
@@ -882,7 +885,7 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                     result[key] = {"days": 0}
                     continue
-                await self._rewrite_statistics(service, stat_type, readings)
+                await self._merge_usage(service, stat_type, readings)
                 result[key] = {
                     "days": len(readings),
                     "first_day": dt_util.as_local(readings[0].date).date().isoformat(),
@@ -1022,21 +1025,38 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Fetching MyTPU billing history failed: %s", err)
             return set()
         self._last_billing_check = now
-        if not bills:
-            # Nothing to price from; the price-entity import covers costs
-            self._force_cost_rebuild = False
-            return set()
 
-        latest = max(bill.date for bill in bills).isoformat()
+        # Meters that can't be priced from bills (no bills yet, or a shared
+        # meter type) are repriced at the estimate after a history import,
+        # since the incremental import only prices days after its last row.
+        priceable = (
+            [
+                job
+                for job in cost_jobs
+                if self._bills_attributable(job[0], job[1], account_services)
+            ]
+            if bills
+            else []
+        )
+        rebuilt: set[str] = set()
+        if self._force_cost_rebuild:
+            rebuilt |= await self._reprice_at_estimate(
+                [job for job in cost_jobs if job not in priceable]
+            )
+        if not bills:
+            self._force_cost_rebuild = False
+            return rebuilt
+
+        latest_bill = max(bills, key=lambda bill: bill.date)
+        latest = latest_bill.date.isoformat()
         pending = [
             job
-            for job in cost_jobs
+            for job in priceable
             if self._applied_bills.get(SERVICE_KEYS[job[1]]) != latest
-            and self._bills_attributable(job[0], job[1], account_services)
         ]
         if not pending:
             self._force_cost_rebuild = False
-            return set()
+            return rebuilt
 
         # Re-fetch usage so each day carries the bill that charged for it. Fetch
         # every meter before writing, so a failure leaves all costs as they were.
@@ -1047,17 +1067,18 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (MyTPUError, TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.warning("Fetching usage to price from bills failed: %s", err)
             self._last_billing_check = None
-            return set()
+            return rebuilt
 
         _LOGGER.info("Repricing costs from MyTPU bills through %s", latest)
-        rebuilt: set[str] = set()
         for job, readings in fetched:
             service, stat_type, statistic_id, new_stats, price_entity, _ = job
             key = SERVICE_KEYS[stat_type]
+            await self._apply_corrections(service, stat_type, statistic_id, readings)
+
             division = BILLING_DIVISIONS[service.service_type.value]
             summaries = summarize_bills(readings, bills, division)
             self.rates[key] = rate_summary(summaries)
-            if await self._write_billed_costs(
+            written = await self._write_billed_costs(
                 service,
                 stat_type,
                 statistic_id,
@@ -1065,15 +1086,135 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 readings,
                 summaries,
                 self._estimate_price(stat_type, price_entity),
+            )
+            if written:
+                rebuilt.add(stat_type)
+            # Applied only once the latest bill's own days were priced; until
+            # its rows carry the invoice, retry at the next check
+            amount = latest_bill.amounts.get(division)
+            if written and (
+                latest_bill.date in summaries or amount is None or amount <= 0
             ):
                 self._applied_bills[key] = latest
-                rebuilt.add(stat_type)
             else:
-                _LOGGER.info("No %s usage to price from bills yet", key)
+                _LOGGER.info(
+                    "%s usage for the %s bill isn't available yet; will retry",
+                    key,
+                    latest,
+                )
 
         self._force_cost_rebuild = False
         await self._async_save_billing()
         return rebuilt
+
+    async def _reprice_at_estimate(
+        self,
+        cost_jobs: list[
+            tuple[Service, str, str, list[StatisticData], str | None, bool]
+        ],
+    ) -> set[str]:
+        """Reprice every usage day of these meters at the estimate."""
+        rebuilt: set[str] = set()
+        for service, stat_type, statistic_id, new_stats, price_entity, _ in cost_jobs:
+            estimate = self._estimate_price(stat_type, price_entity)
+            if estimate is None:
+                continue
+            usage = await self._usage_days(statistic_id, new_stats)
+            readings = [
+                UsageReading(
+                    date=datetime.fromtimestamp(day, tz=UTC),
+                    consumption=consumption,
+                    unit="",
+                )
+                for day, consumption in sorted(usage.items())
+            ]
+            if await self._write_billed_costs(
+                service, stat_type, statistic_id, new_stats, readings, {}, estimate
+            ):
+                rebuilt.add(stat_type)
+        return rebuilt
+
+    async def _apply_corrections(
+        self,
+        service: Service,
+        stat_type: str,
+        statistic_id: str,
+        readings: list[UsageReading],
+    ) -> None:
+        """Update stored usage days whose TPU reading has since changed.
+
+        TPU can replace an estimated reading with a confirmed one. Only days
+        already in the usage series are compared and updated, so usage and
+        costs keep describing the same consumption.
+        """
+        usage = await self._usage_days(statistic_id, [])
+        stored = [r for r in readings if r.date.timestamp() in usage]
+        corrected = [
+            r
+            for r in stored
+            if abs(usage[r.date.timestamp()] - r.consumption) > USAGE_TOLERANCE
+        ]
+        if corrected:
+            _LOGGER.info(
+                "Updating %s %s readings that MyTPU has corrected",
+                len(corrected),
+                SERVICE_KEYS[stat_type],
+            )
+            await self._merge_usage(service, stat_type, stored)
+
+    async def _usage_days(
+        self, statistic_id: str, new_stats: list[StatisticData]
+    ) -> dict[float, float]:
+        """Return each usage day's consumption by start timestamp.
+
+        Includes rows queued this update, which may not be committed yet, and
+        leaves out the synthetic zero row the series opens with the day before
+        its first reading. Real zero-usage days come later and are kept.
+        """
+        usage = await self.hass.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            datetime(1970, 1, 1, tzinfo=UTC),
+            None,
+            {statistic_id},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+        rows = {
+            float(row["start"]): (float(row.get("state") or 0.0), row.get("sum"))
+            for row in usage.get(statistic_id, [])
+        }
+        rows.update(
+            (row["start"].timestamp(), (float(row.get("state") or 0.0), row.get("sum")))
+            for row in new_stats
+        )
+        days = sorted(rows)
+        if days and rows[days[0]] in ((0.0, 0.0), (0.0, None)):
+            del rows[days[0]]
+        return {day: state for day, (state, _) in rows.items()}
+
+    async def _merge_usage(
+        self, service: Service, stat_type: str, readings: list[UsageReading]
+    ) -> None:
+        """Rewrite the usage series with these readings merged into it.
+
+        Readings replace stored days with the same date; other stored days
+        are kept. Running totals are recalculated from the first day.
+        """
+        statistic_id = self._statistic_id(service, stat_type)
+        merged = {
+            day: UsageReading(
+                date=datetime.fromtimestamp(day, tz=UTC),
+                consumption=consumption,
+                unit="",
+            )
+            for day, consumption in (await self._usage_days(statistic_id, [])).items()
+        }
+        merged.update((reading.date.timestamp(), reading) for reading in readings)
+        await self._rewrite_statistics(
+            service, stat_type, [merged[day] for day in sorted(merged)]
+        )
 
     def _bills_attributable(
         self, service: Service, stat_type: str, account_services: list[Service]
@@ -1126,43 +1267,21 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         summaries: dict[date, BillUsage],
         estimate: float | None,
     ) -> bool:
-        """Reprice a meter's cost series from bills, keeping what can't be repriced.
+        """Reprice a meter's cost series, keeping what can't be repriced.
 
-        Every day of the usage series gets its repriced cost, or else its
-        existing cost (e.g. days older than MyTPU's history, or estimates when
-        no estimate is available now), and running totals are recalculated.
-        Returns False, writing nothing, if no usage day could be repriced.
+        Every usage day gets its repriced cost, or else its existing cost
+        (e.g. days older than MyTPU's history, or estimates when no estimate
+        is available now). Days that only have a cost are kept too. Running
+        totals are recalculated. Returns False, writing nothing, if no usage
+        day could be repriced.
         """
-        usage = await self.hass.async_add_executor_job(
-            statistics_during_period,
-            self.hass,
-            datetime(1970, 1, 1, tzinfo=UTC),
-            None,
-            {statistic_id},
-            "hour",
-            None,
-            {"state", "sum"},
-        )
-        rows = {
-            float(row["start"]): (float(row.get("state") or 0.0), row.get("sum"))
-            for row in usage.get(statistic_id, [])
-        }
-        # Include rows queued this update, which may not be committed yet
-        rows.update(
-            (row["start"].timestamp(), (float(row.get("state") or 0.0), row.get("sum")))
-            for row in new_stats
-        )
-        usage_days = sorted(rows)
-        # The series opens with a synthetic zero row the day before its first
-        # reading; it isn't a usage day. Real zero-usage days come later.
-        if usage_days and rows[usage_days[0]] in ((0.0, 0.0), (0.0, None)):
-            usage_days = usage_days[1:]
-
+        usage = await self._usage_days(statistic_id, new_stats)
         repriced = {
             start.timestamp(): cost
             for start, cost in daily_costs(readings, summaries, estimate)
+            if start.timestamp() in usage
         }
-        if not any(day in repriced for day in usage_days):
+        if not repriced:
             return False
 
         metadata = self._cost_metadata(service, stat_type)
@@ -1181,9 +1300,12 @@ class TPUDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             float(row["start"]): float(row.get("state") or 0.0)
             for row in existing.get(cost_id, [])
         }
+        # Like usage, the cost series opens with a synthetic zero row
+        if previous and previous[min(previous)] == 0.0:
+            del previous[min(previous)]
 
         priced: list[tuple[float, float]] = []
-        for day in usage_days:
+        for day in sorted(set(usage) | set(previous)):
             cost = repriced.get(day, previous.get(day))
             if cost is not None:
                 priced.append((day, cost))

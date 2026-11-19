@@ -148,6 +148,7 @@ class TestImportHistory:
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             patch("custom_components.mytpu.async_add_external_statistics") as mock_add,
         ):
             result = await coordinator.async_import_history()
@@ -182,6 +183,7 @@ class TestImportHistory:
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             pytest.raises(HomeAssistantError, match="Fetching history"),
         ):
             await coordinator.async_import_history()
@@ -197,7 +199,10 @@ class TestImportHistory:
         coordinator.client.get_usage = AsyncMock(return_value=[])
         recorder = _recorder()
 
-        with patch("custom_components.mytpu.get_instance", return_value=recorder):
+        with (
+            patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
+        ):
             result = await coordinator.async_import_history()
 
         recorder.async_clear_statistics.assert_not_called()
@@ -214,6 +219,7 @@ class TestImportHistory:
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             patch("custom_components.mytpu.HISTORY_COMMIT_TIMEOUT_SECONDS", 0.01),
             patch("custom_components.mytpu.async_add_external_statistics"),
             pytest.raises(HomeAssistantError, match="updates are paused"),
@@ -245,6 +251,7 @@ class TestImportHistory:
 
         with (
             patch("custom_components.mytpu.get_instance", return_value=recorder),
+            patch("custom_components.mytpu.statistics_during_period", return_value={}),
             patch("custom_components.mytpu.HISTORY_COMMIT_TIMEOUT_SECONDS", 0.01),
             patch("custom_components.mytpu.async_add_external_statistics"),
             pytest.raises(HomeAssistantError, match="updates are paused"),

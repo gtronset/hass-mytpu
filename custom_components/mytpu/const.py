@@ -41,6 +41,8 @@ BILLING_CATEGORIES = [
     "Surface Water",
     "AdjDepFee",
 ]
+# A stored day whose TPU reading differs by more than this is updated
+USAGE_TOLERANCE = 1e-6
 # Currency MyTPU bills are in
 BILLING_CURRENCY = "USD"
 # Billing division that charges for each meter's usage, by service type

@@ -149,18 +149,20 @@ def rate_summary(summaries: dict[date, BillUsage]) -> dict[str, float | str | in
 
     The trailing rate is the total charged over the last TRAILING_RATE_BILLS
     bills divided by their usage, so one unusual month (e.g. very low water
-    use against fixed charges) doesn't swing it. Empty if no bill has usage.
+    use against fixed charges) doesn't swing it. Bills with no usage still
+    count their amount. The last bill's rate is left out when it had no
+    usage. Empty if no bill in the window has usage.
     """
-    with_usage = sorted(
-        (s for s in summaries.values() if s.usage > 0), key=lambda s: s.invoice
-    )
-    if not with_usage:
+    recent = sorted(summaries.values(), key=lambda s: s.invoice)[-TRAILING_RATE_BILLS:]
+    usage = sum(s.usage for s in recent)
+    if not usage:
         return {}
-    recent = with_usage[-TRAILING_RATE_BILLS:]
-    last = with_usage[-1]
-    return {
-        "rate": round(sum(s.amount for s in recent) / sum(s.usage for s in recent), 6),
+    last = recent[-1]
+    summary: dict[str, float | str | int] = {
+        "rate": round(sum(s.amount for s in recent) / usage, 6),
         "bills": len(recent),
-        "last_bill_rate": round(last.amount / last.usage, 6),
         "last_bill_date": last.invoice.isoformat(),
     }
+    if last.usage > 0:
+        summary["last_bill_rate"] = round(last.amount / last.usage, 6)
+    return summary
