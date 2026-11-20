@@ -444,7 +444,7 @@ class TestTPUDataUpdateCoordinator:
         self, hass: HomeAssistant, mock_token_data
     ):
         """Test that token data is not saved if unchanged."""
-        from pytest_homeassistant_custom_component.common import MockConfigEntry
+        from pytest_homeassistant.common import MockConfigEntry
 
         config_entry = MockConfigEntry(
             domain=DOMAIN,

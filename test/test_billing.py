@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
-from aioresponses import aioresponses
 from homeassistant.components.recorder.models import StatisticData
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CoreState, HomeAssistant
@@ -81,7 +80,7 @@ class TestModels:
 class TestGetBillingHistory:
     """MyTPUClient.get_billing_history."""
 
-    async def test_parses_statements(self, mock_account_info):
+    async def test_parses_statements(self, mock_account_info, mock_api):
         """Division amounts are merged per billing date and sorted oldest first."""
         client = MyTPUClient(MyTPUAuth())
         client._account_context = mock_account_info["accountContext"]
@@ -122,23 +121,21 @@ class TestGetBillingHistory:
                 },
             ]
         }
-        with (
-            patch.object(client._auth, "get_token", new=AsyncMock(return_value="test")),
-            aioresponses() as m,
+        mock_api.post(f"{BASE_URL}/rest/billing/history", json=payload)
+        with patch.object(
+            client._auth, "get_token", new=AsyncMock(return_value="test")
         ):
-            m.post(f"{BASE_URL}/rest/billing/history", payload=payload)
             async with client:
                 bills = await client.get_billing_history(
                     datetime(2024, 10, 1), datetime(2026, 11, 18)
                 )
-            assert m.requests
-            request = next(iter(m.requests.values()))[0]
 
         assert bills == [
             Bill(date=OCT_5, amounts={"Power": 103.06}),
             Bill(date=NOV_3, amounts={"Power": 98.11, "Water": 1039.31}),
         ]
-        body = request.kwargs["json"]
+        assert mock_api.call_count == 1
+        body = mock_api.mock_calls[0][2]
         assert body["fromDate"] == "2024-10-01"
         assert body["toDate"] == "2026-11-18"
         assert "Power" in body["billingCategory"]

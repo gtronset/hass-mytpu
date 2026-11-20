@@ -50,7 +50,7 @@ async def test_async_setup_entry_power_only(hass: HomeAssistant, mock_power_serv
     import json
 
     from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-    from pytest_homeassistant_custom_component.common import MockConfigEntry
+    from pytest_homeassistant.common import MockConfigEntry
 
     # Create config entry with only power service
     power_only_entry = MockConfigEntry(
@@ -94,7 +94,7 @@ async def test_async_setup_entry_water_only(hass: HomeAssistant, mock_water_serv
     import json
 
     from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-    from pytest_homeassistant_custom_component.common import MockConfigEntry
+    from pytest_homeassistant.common import MockConfigEntry
 
     # Create config entry with only water service
     water_only_entry = MockConfigEntry(

@@ -16,7 +16,14 @@ if TYPE_CHECKING:
     from homeassistant.helpers.typing import ConfigType
 
 import aiohttp
-import voluptuous as vol
+
+# Home Assistant 2026.11+ validates with probatio and aliases voluptuous to it,
+# so importing voluptuous always matches the engine Home Assistant uses. Type
+# checkers don't see the alias, so check against probatio.
+if TYPE_CHECKING:
+    import probatio as vol
+else:
+    import voluptuous as vol
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
