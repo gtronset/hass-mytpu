@@ -1,5 +1,6 @@
 """Pytest configuration and fixtures for mytpu tests."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 from custom_components.mytpu.auth import MyTPUAuth
 from custom_components.mytpu.client import MyTPUClient
@@ -19,9 +20,6 @@ from custom_components.mytpu.const import (
     DOMAIN,
 )
 from custom_components.mytpu.models import Service, ServiceType
-
-# This fixture is required for all tests
-pytest_plugins = "pytest_homeassistant_custom_component"
 
 
 @pytest.fixture(autouse=True)
@@ -63,12 +61,6 @@ def recorder_executor(request):
     recorder.async_add_executor_job = AsyncMock(side_effect=_run_in_place)
     with patch("custom_components.mytpu.get_instance", return_value=recorder):
         yield recorder
-
-
-@pytest.fixture(autouse=True)
-def auto_enable_custom_integrations(enable_custom_integrations):
-    """Enable custom integrations for all tests."""
-    yield
 
 
 @pytest.fixture
@@ -166,6 +158,25 @@ def mock_config_entry(
         unique_id="test_unique_id",
         title="TPU - Test User",
     )
+
+
+@pytest.fixture
+async def mock_session(aioclient_mock):
+    """Return an aiohttp session whose requests are answered by aioclient_mock."""
+    session = aioclient_mock.create_session(asyncio.get_running_loop())
+    yield session
+    await session.close()
+
+
+@pytest.fixture
+def mock_api(aioclient_mock):
+    """Answer MyTPUClient's requests from aioclient_mock."""
+
+    def create_session(_client):
+        return aioclient_mock.create_session(asyncio.get_running_loop())
+
+    with patch.object(MyTPUClient, "_create_session", create_session):
+        yield aioclient_mock
 
 
 @pytest.fixture

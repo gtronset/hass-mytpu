@@ -13,7 +13,7 @@ from homeassistant.exceptions import (
     Unauthorized,
 )
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant.common import MockConfigEntry
 
 from custom_components.mytpu import TPUDataUpdateCoordinator, async_setup
 from custom_components.mytpu.client import MyTPUError

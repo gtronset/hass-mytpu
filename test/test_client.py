@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aioresponses import aioresponses
 
 from custom_components.mytpu.auth import BASE_URL, MyTPUAuth, TokenInfo
 from custom_components.mytpu.client import MyTPUClient, MyTPUError
@@ -96,7 +95,7 @@ class TestMyTPUClient:
         await client.close()
 
     async def test_get_account_info_success(
-        self, mock_account_info, mock_token_response
+        self, mock_account_info, mock_token_response, mock_api
     ):
         """Test successful account info retrieval."""
         auth = MyTPUAuth()
@@ -114,24 +113,23 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/account/customer/",
-                        status=200,
-                        payload=mock_account_info,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/account/customer/",
+                    status=200,
+                    json=mock_account_info,
+                )
 
-                    result = await client.get_account_info()
+                result = await client.get_account_info()
 
-                    assert result == mock_account_info
-                    assert client._account_context is not None
-                    assert client._account_context["accountHolder"] == "Test User"
-                    assert client._services is not None
-                    assert len(client._services) == 2
-                    assert client._services[0].meter_number == "MOCK_POWER_METER"
-                    assert client._services[0].service_type == ServiceType.POWER
-                    assert client._services[1].meter_number == "MOCK_WATER_METER"
-                    assert client._services[1].service_type == ServiceType.WATER
+                assert result == mock_account_info
+                assert client._account_context is not None
+                assert client._account_context["accountHolder"] == "Test User"
+                assert client._services is not None
+                assert len(client._services) == 2
+                assert client._services[0].meter_number == "MOCK_POWER_METER"
+                assert client._services[0].service_type == ServiceType.POWER
+                assert client._services[1].meter_number == "MOCK_WATER_METER"
+                assert client._services[1].service_type == ServiceType.WATER
 
     async def test_get_account_info_requires_customer_id(self):
         """Test that get_account_info raises error if no customer_id."""
@@ -143,7 +141,7 @@ class TestMyTPUClient:
             with pytest.raises(MyTPUError, match="Customer ID not available"):
                 await client.get_account_info()
 
-    async def test_get_account_info_api_error(self):
+    async def test_get_account_info_api_error(self, mock_api):
         """Test handling of API error during account info fetch."""
         auth = MyTPUAuth()
         client = MyTPUClient(auth)
@@ -158,17 +156,16 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/account/customer/",
-                        status=500,
-                        body="Internal Server Error",
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/account/customer/",
+                    status=500,
+                    text="Internal Server Error",
+                )
 
-                    with pytest.raises(MyTPUError, match="API request failed: 500"):
-                        await client.get_account_info()
+                with pytest.raises(MyTPUError, match="API request failed: 500"):
+                    await client.get_account_info()
 
-    async def test_get_services_cached(self, mock_account_info):
+    async def test_get_services_cached(self, mock_account_info, mock_api):
         """Test that get_services returns cached services."""
         auth = MyTPUAuth()
         client = MyTPUClient(auth)
@@ -183,23 +180,23 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/account/customer/",
-                        status=200,
-                        payload=mock_account_info,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/account/customer/",
+                    status=200,
+                    json=mock_account_info,
+                )
 
-                    # First call fetches account info
-                    services1 = await client.get_services()
-                    assert len(services1) == 2
+                # First call fetches account info
+                services1 = await client.get_services()
+                assert len(services1) == 2
 
-                    # Second call uses cached services (no new request)
-                    services2 = await client.get_services()
-                    assert len(services2) == 2
-                    assert services1 is services2
+                # Second call uses cached services (no new request)
+                services2 = await client.get_services()
+                assert len(services2) == 2
+                assert services1 is services2
+                assert mock_api.call_count == 1
 
-    async def test_get_services_fetches_if_none(self, mock_account_info):
+    async def test_get_services_fetches_if_none(self, mock_account_info, mock_api):
         """Test that get_services fetches account info if services not cached."""
         auth = MyTPUAuth()
         client = MyTPUClient(auth)
@@ -214,20 +211,19 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/account/customer/",
-                        status=200,
-                        payload=mock_account_info,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/account/customer/",
+                    status=200,
+                    json=mock_account_info,
+                )
 
-                    services = await client.get_services()
+                services = await client.get_services()
 
-                    assert len(services) == 2
-                    assert services[0].meter_number == "MOCK_POWER_METER"
+                assert len(services) == 2
+                assert services[0].meter_number == "MOCK_POWER_METER"
 
     async def test_get_usage_success(
-        self, mock_power_service, mock_account_info, mock_usage_response
+        self, mock_power_service, mock_account_info, mock_usage_response, mock_api
     ):
         """Test successful usage data retrieval."""
         auth = MyTPUAuth()
@@ -244,28 +240,27 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/usage/month",
-                        status=200,
-                        payload=mock_usage_response,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/usage/month",
+                    status=200,
+                    json=mock_usage_response,
+                )
 
-                    from_date = datetime(2026, 1, 1)
-                    to_date = datetime(2026, 1, 5)
-                    readings = await client.get_usage(
-                        mock_power_service, from_date, to_date
-                    )
+                from_date = datetime(2026, 1, 1)
+                to_date = datetime(2026, 1, 5)
+                readings = await client.get_usage(
+                    mock_power_service, from_date, to_date
+                )
 
-                    assert len(readings) == 2
-                    assert readings[0].date == datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
-                    assert readings[0].consumption == 25.5
-                    assert readings[0].unit == "kWh"
-                    assert readings[1].date == datetime(2026, 1, 2, 8, 0, tzinfo=UTC)
-                    assert readings[1].consumption == 28.3
+                assert len(readings) == 2
+                assert readings[0].date == datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+                assert readings[0].consumption == 25.5
+                assert readings[0].unit == "kWh"
+                assert readings[1].date == datetime(2026, 1, 2, 8, 0, tzinfo=UTC)
+                assert readings[1].consumption == 28.3
 
     async def test_get_usage_default_dates(
-        self, mock_power_service, mock_account_info, mock_usage_response
+        self, mock_power_service, mock_account_info, mock_usage_response, mock_api
     ):
         """Test usage retrieval with default date range."""
         auth = MyTPUAuth()
@@ -282,19 +277,18 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/usage/month",
-                        status=200,
-                        payload=mock_usage_response,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/usage/month",
+                    status=200,
+                    json=mock_usage_response,
+                )
 
-                    readings = await client.get_usage(mock_power_service)
+                readings = await client.get_usage(mock_power_service)
 
-                    assert len(readings) == 2
+                assert len(readings) == 2
 
     async def test_get_usage_fetches_account_info_if_needed(
-        self, mock_power_service, mock_account_info, mock_usage_response
+        self, mock_power_service, mock_account_info, mock_usage_response, mock_api
     ):
         """Test that get_usage fetches account info if not cached."""
         auth = MyTPUAuth()
@@ -310,25 +304,24 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/account/customer/",
-                        status=200,
-                        payload=mock_account_info,
-                    )
-                    m.post(
-                        f"{BASE_URL}/rest/usage/month",
-                        status=200,
-                        payload=mock_usage_response,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/account/customer/",
+                    status=200,
+                    json=mock_account_info,
+                )
+                mock_api.post(
+                    f"{BASE_URL}/rest/usage/month",
+                    status=200,
+                    json=mock_usage_response,
+                )
 
-                    readings = await client.get_usage(mock_power_service)
+                readings = await client.get_usage(mock_power_service)
 
-                    assert client._account_context is not None
-                    assert len(readings) == 2
+                assert client._account_context is not None
+                assert len(readings) == 2
 
     async def test_get_usage_with_optional_fields(
-        self, mock_account_info, mock_usage_response
+        self, mock_account_info, mock_usage_response, mock_api
     ):
         """Test usage request includes optional service fields."""
 
@@ -358,19 +351,22 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/usage/month",
-                        status=200,
-                        payload=mock_usage_response,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/usage/month",
+                    status=200,
+                    json=mock_usage_response,
+                )
 
-                    await client.get_usage(service)
+                await client.get_usage(service)
 
-                    # Verify the request was made (aioresponses will validate)
+                body = mock_api.mock_calls[0][2]
+                assert body["latitude"] == "47.2529"
+                assert body["longitude"] == "-122.4443"
+                assert body["contractNum"] == "CNT001"
+                assert body["totalizerInd"] == "Y"
 
     async def test_get_usage_filters_invalid_dates(
-        self, mock_power_service, mock_account_info
+        self, mock_power_service, mock_account_info, mock_api
     ):
         """Test that readings without usageDate are filtered out."""
         response_with_invalid = {
@@ -403,20 +399,19 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/usage/month",
-                        status=200,
-                        payload=response_with_invalid,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/usage/month",
+                    status=200,
+                    json=response_with_invalid,
+                )
 
-                    readings = await client.get_usage(mock_power_service)
+                readings = await client.get_usage(mock_power_service)
 
-                    # Should only have 2 readings (invalid one filtered out)
-                    assert len(readings) == 2
+                # Should only have 2 readings (invalid one filtered out)
+                assert len(readings) == 2
 
     async def test_get_usage_filters_monthly_placeholders(
-        self, mock_power_service, mock_account_info
+        self, mock_power_service, mock_account_info, mock_api
     ):
         """Test that unfinalized monthly (M) entries are filtered out."""
         response_with_monthly = {
@@ -456,19 +451,18 @@ class TestMyTPUClient:
                 customer_id="CUST123",
             )
             async with client:
-                with aioresponses() as m:
-                    m.post(
-                        f"{BASE_URL}/rest/usage/month",
-                        status=200,
-                        payload=response_with_monthly,
-                    )
+                mock_api.post(
+                    f"{BASE_URL}/rest/usage/month",
+                    status=200,
+                    json=response_with_monthly,
+                )
 
-                    readings = await client.get_usage(mock_power_service)
+                readings = await client.get_usage(mock_power_service)
 
-                    # Only the D entry should be returned; M entries are filtered
-                    assert len(readings) == 1
-                    assert readings[0].date == datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
-                    assert readings[0].consumption == 25.5
+                # Only the D entry should be returned; M entries are filtered
+                assert len(readings) == 1
+                assert readings[0].date == datetime(2026, 1, 1, 8, 0, tzinfo=UTC)
+                assert readings[0].consumption == 25.5
 
     async def test_async_login(self):
         """Test async_login delegates to auth.async_login."""

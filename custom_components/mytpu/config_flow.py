@@ -7,7 +7,14 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import voluptuous as vol
+# Home Assistant 2026.11+ validates with probatio; older releases use voluptuous.
+if TYPE_CHECKING:
+    import probatio as vol
+else:
+    try:
+        import probatio as vol
+    except ImportError:
+        import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, OptionsFlow
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.data_entry_flow import AbortFlow
